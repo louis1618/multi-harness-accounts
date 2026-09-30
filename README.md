@@ -1,0 +1,145 @@
+# Paseo Multi-Harness Accounts
+
+Paseo Sidebar의 **계정**에서 Codex와 Claude Code의 네이티브 로그인 계정을 관리하는 로컬 플러그인입니다. 독립 프로필 디렉터리를 실제 하네스 프로세스에 전달합니다.
+
+## 설치
+
+Paseo **0.10.x**, Node.js **22 이상**, `codex`, `claude`, `paseo` CLI가 daemon 호스트의 PATH에 필요합니다.
+
+GitHub에서 설치:
+
+```sh
+paseo plugin install https://github.com/louis1618/multi-harness-accounts.git
+paseo plugin ls
+```
+
+소스를 직접 수정하려면 저장소를 내려받아 로컬 경로로 설치합니다.
+
+```sh
+git clone https://github.com/louis1618/multi-harness-accounts.git
+cd multi-harness-accounts
+paseo plugin install "$(pwd)"
+```
+
+ZIP을 풀어서 설치하는 경우에도 플러그인 디렉터리 안에서 `paseo plugin install "$(pwd)"`를 실행합니다. 설치 명령에는 실제 디렉터리의 절대 경로가 전달되어야 합니다.
+
+Settings → Plugins의 Enable plugins가 켜져 있어야 합니다. 꺼져 있으면 설치는 가능하지만 `paseo plugin ls`의 상태가 `disabled`이고 Sidebar에는 나타나지 않습니다. 실행 설정을 켠 뒤 Sidebar에서 **계정**을 엽니다. 이 플러그인은 호스트별로 한 번 설치합니다. 원본 프로젝트를 수정했다면 `paseo plugin reload multi-harness-accounts`로 적용합니다.
+
+개발·검증:
+
+```sh
+npm ci
+npm run typecheck
+npm test
+npm run test:native
+```
+
+`npm ci`는 개발용 타입 검사·테스트에 필요합니다. 실행 코드의 Paseo API 타입은 호스트가 제공하는 `PluginHandlerContext["paseo"]`에서 가져옵니다. 개발용 `node_modules`가 없는 배포 폴더에서 실제 플러그인 빌드와 `accounts.list` RPC의 정상 동작도 확인했습니다.
+
+## 사용
+
+상단 **사용량 / 계정** 탭으로 나눕니다. 사용량 탭에는 누적 토큰·턴·캐시 입력, 토큰 구성, 계정별 사용량과 최근 사용을 표시합니다. 계정 탭에는 서비스 로고와 개별 계정 카드, 기본 계정과 한도를 표시합니다. 화면 전체 새로고침은 최하단에 있습니다.
+
+- **기존 로그인 표시**: Paseo 밖에서 로그인한 Codex·Claude Code 계정도 자동 조회해 시스템 계정으로 표시합니다. 기본값이 시스템 로그인이면 이 계정에 기본 계정이 표시됩니다. 기존 계정은 원래 네이티브 인증 저장소를 사용합니다.
+- **계정 추가**: 라벨을 입력하면 해당 프로필에서 `codex login` 또는 `claude auth login --claudeai`를 실행합니다. daemon 호스트의 **기본 웹 브라우저(Firefox, Chrome 등)**에서 인증을 완료합니다.
+- **전환 / 기본 계정**: 하네스의 기본 로그인 계정을 선택합니다. 시스템 로그인은 기존 네이티브 기본 디렉터리를 사용합니다.
+- **에이전트별 계정**: **에이전트 선택**에서 기존 Paseo 세션 또는 외부 CLI 기록을 검색하고 하네스로 필터링합니다. 선택한 Agent에 기본값 상속, 시스템 로그인, 특정 계정을 지정합니다. Agent의 Command Center에서 **에이전트 계정 선택**을 선택해 같은 제어판을 열 수도 있습니다.
+- **다시 로그인**: 확인 모달에서 실행을 승인하면 해당 프로필에서 네이티브 logout/login을 실행합니다. 설정과 기록을 보존하고 로그인 완료 후 영향을 받는 세션을 다시 엽니다.
+- **삭제**: 확인 모달을 거쳐 네이티브 로그아웃 후 추가한 프로필을 제거합니다. 열린 Agent가 사용하는 계정은 먼저 다른 계정으로 전환해야 합니다. 닫히거나 아카이브된 Agent의 기록은 인증정보 없이 보관합니다.
+- **시스템 계정 다시 로그인·로그아웃**: 확인 모달에 이 호스트의 기본 CLI 로그인과 다른 앱에 미치는 영향을 표시합니다. 실제 기본 네이티브 인증을 변경하고 설정·기존 대화를 보존합니다. 실행 중인 작업은 먼저 완료해야 하며 로그아웃 전에는 해당 Agent를 닫거나 다른 계정으로 전환해야 합니다.
+- **Codex·Claude 리셋권**: 각 Codex 계정에서 보유 수와 받은 날·만료일을 조회하고 모달에서 사용할 권리를 선택합니다. 최종 사용 버튼을 눌러야 소모됩니다. 상세 목록 없이 개수만 제공되면 서비스가 권리를 선택합니다. Claude는 남은 횟수·초기화 대상·만료일·사용 조건과 이미 사용한 권리도 표시합니다. 사용할 수 없는 권리는 모달에서 선택과 사용을 막습니다.
+- **로그인 취소 / 전환 다시 시도**: 진행 중인 로그인 취소와 실패한 Agent 재시작을 지원합니다.
+
+같은 하네스의 브라우저 로그인은 하나씩 진행합니다(Codex의 로컬 OAuth 콜백 포트 충돌 방지). 로그인 대기는 10분 뒤 취소됩니다. 브라우저가 없는 원격 daemon은 이 브라우저 로그인 흐름의 검증 범위에 포함되지 않습니다.
+
+## 저장 구조와 보안
+
+```text
+$PASEO_HOME/harness-accounts/
+  metadata.json                    # 계정, 선택/전환 상태, 통계/기준점, 리셋 재시도 요청
+  codex/<UUID>/                    # 각 계정의 CODEX_HOME
+    config.toml                    # file credential store, ChatGPT 로그인
+    auth.json                      # Codex CLI가 관리
+    sessions/ ...                   # 네이티브 기록
+  claude/<UUID>/                   # 각 계정의 CLAUDE_CONFIG_DIR
+    .credentials.json ...          # Claude Code가 관리
+    projects/ ...
+  history/<Agent ID>/             # 제거된 프로필의 닫힌 대화 기록만 보관
+```
+
+디렉터리는 `0700`, 플러그인이 쓰는 파일은 `0600`입니다. 메타데이터는 직렬화한 변경과 임시 파일 → rename으로 저장합니다. 손상된 메타데이터는 자동 초기화하지 않습니다. 프로필의 config/credential 파일과 기록 디렉터리에 대한 symlink를 거부합니다.
+
+공유 타입과 RPC는 Zod로 입력·출력을 검증합니다. 클라이언트에는 계정 표시 정보·전환 상태·한도·토큰 합계만 반환합니다. 네이티브 로그인 출력, credential 파일, access/refresh/ID token은 RPC나 로그로 전달하지 않습니다. ID token의 이메일과 계정 식별 claim은 표시·통계 귀속용으로만 읽고 인증 판단에는 사용하지 않습니다. 통계용 계정 식별자는 SHA-256 해시로 보관하며 RPC에 포함하지 않습니다. 네이티브 프로세스는 `shell: false`로 실행합니다.
+
+계정 프로필 실행에는 환경의 API key/OAuth token/API endpoint override를 빈 값으로 덮어써 다른 인증이 선택되지 않게 합니다. 기존 시스템 계정 조회는 원래 인증 환경을 유지합니다. Codex workload identity가 설정된 환경에서는 프로필 선택을 거부합니다. 프로젝트와 조직의 정책은 하네스가 적용합니다.
+
+로그인할 때는 상속된 앱 브라우저 브릿지를 교체하고 OS 기본 브라우저 실행기로 HTTP/HTTPS 인증 링크를 엽니다(Linux `xdg-open`, macOS `open`). 인증 URL과 로그인 출력은 RPC나 로그로 반환하지 않습니다. 실제 Codex·Claude CLI가 이 실행기를 호출하는 것을 별도 격리 프로필에서 확인했습니다.
+
+## 한도와 사용 통계
+
+- 시스템 계정과 추가한 계정 모두 한도를 표시합니다. Codex는 해당 홈의 네이티브 app-server 계정 RPC, Claude는 해당 홈의 인증 정보와 Paseo의 OAuth usage 조회 방식으로 읽습니다. 추론 요청을 중계하는 프록시는 없습니다.
+- 실제 300분·10080분 기간을 확인해 5시간·주간 한도로 표시합니다. 모델별 주간 한도도 제공되면 함께 표시합니다. 사용률, 잔여율, 초기화 날짜와 `3일 8시간 25분 후` 같은 남은 시간을 표시하며 누락된 한도는 0%로 대체하지 않습니다.
+- 초기화까지 남은 시간은 열린 화면에서 30초마다 다시 계산합니다. 1분 미만과 초기화 시각 경과·갱신 대기를 구분합니다.
+- 한도 캐시는 5분이고 열린 계정 화면은 30초마다 갱신합니다. 조회 중에는 3초마다 확인합니다. 수동 새로고침은 동시 요청을 합치고 오류·요청 제한의 재시도 대기 시간을 지킵니다. 실패하면 마지막 확인값과 조회 시각을 유지합니다.
+- **Paseo 누적 사용량**은 기능 적용 이후 Paseo에서 시작한 턴만 집계합니다. 기존 CLI 기록은 기준점으로 읽고 합계에 더하지 않습니다. 서비스 전체·다른 기기·별도 CLI의 누적 사용량을 뜻하지 않습니다.
+- 입력·출력·캐시 읽기·캐시 쓰기·총 토큰, 실행한 턴 수, 집계 시작일과 마지막 사용 시각을 표시합니다. 입력에는 캐시가 포함되고 총합은 입력+출력입니다. 구독 요금을 토큰 비용으로 추정하지 않습니다.
+- 턴 시작 시 실제 프로필과 계정 신원을 고정합니다. Codex는 세션 누적 카운터의 증분, Claude는 요청·메시지별 중복 제거와 하위 에이전트 기록을 집계합니다. 실패·취소된 턴에서도 확인된 사용량을 반영합니다. 기록이 누락·손상되거나 기준점을 확보하지 못한 경우 **집계 불완전**으로 표시합니다.
+- 대화 기록을 복사해 전환해도 기준점을 이어가며, 프로세스 재시작 후 재사용되는 턴 번호는 실행 식별자로 구분합니다. 통계와 진행 중인 턴 귀속은 원자적으로 함께 저장됩니다. 재로그인으로 실제 계정이 변경되면 이전 계정 통계와 섞이지 않습니다.
+- 전체 목록에서 가장 마지막으로 실제 턴을 시작한 항목에 **최근 사용** 라벨이 붙습니다. 계정 선택·로그인·한도 조회만으로 라벨은 바뀌지 않습니다.
+- 기존 version 1 메타데이터는 계정·기본값·override·대화 위치를 유지하며 version 2로 마이그레이션합니다. 안전한 기존 세션은 계정 화면을 열 때 첫 턴의 기준점을 미리 확보합니다.
+- Linux의 파일 인증 저장소를 검증했습니다. 읽을 수 없는 Keychain 전용 Claude 인증이나 계정 신원을 확인할 수 없는 인증은 한도/통계 이용 불가로 표시하며 다른 프로필의 인증 정보로 대체하지 않습니다.
+
+## 리셋권 처리
+
+Codex의 `account/rateLimits/read`와 `account/rateLimitResetCredit/consume`를 해당 계정 홈에서 호출합니다. 소비 전 최신 로그인 신원·권리 상태·만료를 확인합니다. 네이티브 서비스가 현재 한도를 초기화할 수 있는지 최종 판단하며 `nothingToReset`/`noCredit`는 소모로 표시하지 않습니다.
+
+요청 ID와 선택한 권리를 메타데이터에 저장한 뒤 소비합니다. 응답이 불확실하면 모달을 다시 열거나 daemon을 재시작해도 같은 ID와 같은 권리로 결과를 확인합니다. 완료된 요청을 재전송해 다른 권리를 소모하지 않습니다. 실제 권리 소비·시스템 로그아웃은 테스트용 대역으로 검증했고 사용자 실계정의 권리와 인증은 변경하지 않았습니다.
+
+Claude는 각 `CLAUDE_CONFIG_DIR`의 OAuth 인증으로 `GET /api/oauth/usage?cedar_ember=1&skip_spend=1`를 읽습니다. 사용 전 `/api/oauth/profile`의 실제 계정·조직 신원을 재확인하고 지급 조건, 사용 가능 여부, 잔여 횟수, 만료, 한도 도달 조건을 검사합니다. 리셋권 정보가 빠지거나 손상되어도 기존 한도 조회를 유지하며 리셋권은 정보 미제공/조회 오류로 표시합니다.
+
+Claude의 최종 사용 요청은 `reset_rate_limits`에 프로그램·선택한 권리·저장된 요청 ID를 전송합니다. 불확실한 응답은 10분 동안 같은 요청으로만 재확인하며 자동으로 재전송하지 않습니다. 10분이 지난 미확인 권리는 재사용을 막고 다른 새 권리를 표시할 수 있도록 이전 요청을 보존합니다. 인증·요청 제한·대기·사용 불가 응답을 소비 성공으로 표시하지 않습니다.
+
+## 기존 세션 불러오기
+
+기존 Paseo 세션은 그대로 선택합니다. 외부 세션은 각 프로필의 최근 기록을 조회하며 하네스와 네이티브 세션 ID가 같은 복사본은 하나로 표시합니다. 프로필당 최근 300개, 기록의 앞부분 256 KiB에서 이름·작업 폴더를 읽습니다. 앞부분에서 제목을 찾지 못하면 세션 ID를 이름으로 표시합니다.
+
+외부 기록을 선택하면 현재 하네스 기본 계정의 홈으로 해당 대화 기록만 복사한 뒤 공식 `paseo import`로 가져옵니다. 원본과 credential/config는 보존합니다. 작업 폴더가 없으면 오류를 표시합니다. 새 Paseo 세션 등록 시 이전 토큰을 기준점으로 확보하므로 가져온 기존 기록은 새 사용량에 포함되지 않습니다.
+
+## 세션 전환
+
+`agent.session_open` before-hook이 create/resume/refresh/import 시 선택된 홈을 환경에 주입합니다. 기본값보다 Agent override가 우선합니다. `purpose: history`는 해당 대화가 마지막으로 사용한 홈을 유지합니다.
+
+기존 세션을 다른 계정으로 옮길 때는 그 세션 ID의 native transcript만 새 프로필로 복사합니다. credential과 config는 복사하지 않습니다. Codex의 rollout JSONL, Claude의 프로젝트 JSONL와 해당 세션의 subagent 디렉터리를 옮깁니다. 원본이 없으면 전환을 중지하며 새 대화로 대체하지 않습니다.
+
+idle/error Agent는 `paseo agent reload`로 실제 프로세스를 재시작합니다. 이 명령은 Paseo Agent ID와 persistence/session ID, timeline을 보존합니다. 실행 중인 턴은 완료 이벤트 뒤 다시 상태를 확인해 적용합니다. initializing Agent는 생성 완료 뒤, closed Agent는 다음 열기 때 적용합니다. 실패는 전환 대기 상태에 남고 전환 다시 시도로 재시도합니다. 별도 provider alias는 자동 매핑하지 않으며 기본 `codex`/`claude` provider를 지원합니다.
+
+Paseo 0.10 SDK의 Agent `refresh()`는 조회용이라 실제 재시작에는 공식 CLI를 사용합니다. idle 조회와 CLI 재시작 사이에 다른 클라이언트가 새 턴을 시작하는 경쟁을 원자적으로 막는 API는 없습니다. 프로세스 재시작 시 네이티브 백그라운드 작업은 종료될 수 있습니다. 대화 기록은 유지됩니다.
+
+## 코드
+
+| 파일 | 역할 |
+| --- | --- |
+| `shared/accounts.ts` | 계정·저장 상태·RPC 스키마와 타입 |
+| `server/store.ts` | private 디렉터리와 atomic metadata 저장 |
+| `server/adapters.ts` | 공통 adapter 인터페이스, Codex/Claude 네이티브 인증·환경·기록 이동 |
+| `server/manager.ts` | 선택 우선순위, 로그인 lifecycle, Agent 전환·통계 귀속과 오류 처리 |
+| `server/usage.ts` | 네이티브 한도·리셋권 RPC, 캐시·오류 처리, 사용 기록 파싱 |
+| `server/sessions.ts` | 제한된 네이티브 세션 메타데이터 조회 |
+| `index.server.ts` | daemon RPC와 lifecycle 등록 |
+| `client/accounts.tsx`, `client/branding.ts`, `index.client.tsx` | 사용량/계정 탭·모달, 서비스 로고, Sidebar/Agent 패널 |
+| `tests/accounts.test.mjs` | 독립 로그인 프로세스, override, 지연 재시작, relogin/remove, 비밀 비노출, 경로·손상 검증 |
+| `tests/usage.test.mjs` | 한도·캐시·인증·토큰·중복 이벤트·전환·재시작·마이그레이션·Claude 하위 에이전트 |
+| `tests/management.test.mjs` | 리셋권 선택·재시도·신원 검증, 시스템 확인/로그아웃, 통계 중복 제거, 세션 목록/가져오기 기준점 |
+| `tests/native-smoke.mjs` | 실제 CLI와 오프라인 Codex app-server 대화·다른 홈에서 재개 |
+
+## 확인한 범위
+
+Paseo **0.10.0**, Codex CLI **0.157.1**, Claude Code **2.1.285**, Linux에서 타입체크와 테스트 **24개**를 통과했습니다. 격리된 Paseo daemon에 설치해 `running` 상태, Sidebar 계정 로딩, 기본 계정 전환와 RPC 저장/검증을 확인했습니다. 실제 Paseo Agent를 A 프로필에서 실행한 뒤 B 프로필로 하네스 프로세스를 재시작해 같은 native session ID와 전환 전후 두 응답이 유지되고 각 계정에 12토큰씩 집계되는 것을 확인했습니다. 시스템 Codex·Claude의 실제 한도와 Codex의 리셋권 상세 2개를 조회했습니다. 실제 외부 Codex 기록을 다른 기본 프로필로 가져와 같은 세션 ID·이전 대화를 보존하고 새 12토큰만 집계되는 것을 확인했습니다. 별도 native smoke에서도 Codex app-server 기록 재개를 확인했습니다. 실제 Claude CLI는 빈 독립 홈에서 signed-out 상태를 반환했습니다. 웹 UI의 기본 크기·1280px·390px 폭에서 사용량/계정 탭과 카드 배치를 확인했습니다. 리셋권 선택 모달·시스템 로그인 경고·세션 검색/필터 및 접근성 선택 상태를 확인했습니다.
+
+OAuth 브라우저에서 실제 사용자 계정으로 로그인 완료, 두 실계정으로 유료 모델 턴 실행, Claude의 인증된 모델 세션 재개, macOS/Windows/iOS/Android는 직접 검증하지 않았습니다. `test:native`의 응답 서버는 로컬 테스트 fixture이며 제품의 데이터 경로에는 포함되지 않습니다.
+
+참고한 공식 계약: [Paseo plugin quickstart](https://paseo.sh/docs/plugins), [Plugin reference](https://paseo.sh/docs/plugins/reference), [Paseo agent lifecycle source](https://github.com/getpaseo/paseo/blob/main/docs/agent-lifecycle.md), [Claude environment variables](https://code.claude.com/docs/en/env-vars).
+
+서비스 로고는 설치된 [OpenCodex](https://github.com/lidge-jun/opencodex)의 provider-icons에서 가져온 OpenAI·Claude 마크이며 각 서비스의 상표입니다. Codex 한도·리셋권은 [Codex app-server 공식 계약](https://developers.openai.com/codex/app-server/)을 따릅니다.
+
+Claude 리셋권 조회·사용 계약은 OpenCodex의 `src/providers/anthropic-reset-grants.ts` 구현을 참고했습니다. 실제 계정 검증은 GET 조회만 수행했고 사용 요청은 가짜 응답으로만 검증했습니다.

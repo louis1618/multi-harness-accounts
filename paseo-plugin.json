@@ -1,0 +1,7 @@
+{
+  "id": "multi-harness-accounts",
+  "description": "Codex·Claude Code 계정 전환, 사용량 대시보드, 리셋권과 기존 세션 관리.",
+  "requirements": {
+    "paseo": ">=0.10.0 <0.11.0"
+  }
+}

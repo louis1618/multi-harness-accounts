@@ -1,0 +1,246 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import { mkdtemp, mkdir, writeFile, appendFile, readFile, rm } from "node:fs/promises";
+import { join, basename } from "node:path";
+import { tmpdir } from "node:os";
+import { randomUUID } from "node:crypto";
+import { parseCodexQuota, parseClaudeQuota, parseUsage, claudeQuota, codexQuota, QuotaCache, QuotaError } from "../.test-build/server/usage.js";
+import { createAdapters } from "../.test-build/server/adapters.js";
+import { AccountManager } from "../.test-build/server/manager.js";
+import { SnapshotSchema } from "../.test-build/shared/accounts.js";
+
+async function temporary(t) {
+  const root = await mkdtemp(join(tmpdir(), "paseo-usage-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  return root;
+}
+const limit = () => parseCodexQuota({ rateLimits: { primary: { usedPercent: 25, windowDurationMins: 300, resetsAt: 1790800000 } } }, "pro");
+const codexLine = (input, output, cached = 0) => JSON.stringify({ type: "event_msg", payload: { type: "token_count", info: {
+  total_token_usage: { input_tokens: input, output_tokens: output, cached_input_tokens: cached },
+  last_token_usage: { input_tokens: 8, output_tokens: 4, cached_input_tokens: 0 },
+} } }) + "\n";
+const claudeLine = (id, output = 4) => JSON.stringify({ type: "assistant", requestId: "request-" + id,
+  message: { id, usage: { input_tokens: 8, output_tokens: output, cache_read_input_tokens: 3, cache_creation_input_tokens: 2 } } }) + "\n";
+
+test("quotas distinguish real durations, missing data, multi-bucket and Claude scoped weekly limits", () => {
+  const value = parseCodexQuota({ rateLimits: { primary: { usedPercent: 99, windowDurationMins: 300 } },
+    rateLimitsByLimitId: { codex: {
+      primary: { usedPercent: 10, windowDurationMins: 15 },
+      secondary: { usedPercent: 60, windowDurationMins: 10080, resetsAt: 1790800000 },
+    }, other: { limitName: "모델별", primary: { usedPercent: 110, windowDurationMins: 300 } } } });
+  assert.equal(value.windows.length, 2);
+  assert.equal(value.windows[0].label, "주간 한도");
+  assert.equal(value.windows[1].usedPercent, 100);
+  assert.equal(parseCodexQuota({ rateLimits: { primary: { windowDurationMins: 300 } } }).windows.length, 0);
+  assert.equal(parseCodexQuota({}).windows.length, 0);
+  assert.deepEqual(parseCodexQuota({ rateLimitsByLimitId: {
+    reserve: { secondary: { usedPercent: 0, windowDurationMins: 10080 } },
+    codex: { primary: { usedPercent: 40, windowDurationMins: 300 }, secondary: { usedPercent: 60, windowDurationMins: 10080 } },
+  } }).windows.map(row => row.label), ["5시간 한도", "주간 한도", "주간 한도 · reserve"]);
+  const claude = parseClaudeQuota({ five_hour: { utilization: 0, resets_at: "2026-10-01T00:00:00Z" },
+    seven_day: null, limits: [{ kind: "weekly_scoped", percent: 42, scope: { model: { id: "sonnet", display_name: "Sonnet" } } }, { kind: "unknown" }] });
+  assert.deepEqual(claude.windows.map(row => row.label), ["5시간 한도", "주간 한도 · Sonnet"]);
+  assert.equal(claude.windows[0].usedPercent, 0);
+  assert.equal(parseClaudeQuota({ five_hour: { utilization: null } }).windows.length, 0);
+});
+
+test("Claude uses exact home, readonly credentials, handles auth/rate limits and sanitizes network errors", async t => {
+  const root = await temporary(t), home = join(root, "profile"), wrong = join(root, "other");
+  await mkdir(home); await mkdir(wrong);
+  const credentials = JSON.stringify({ claudeAiOauth: { accessToken: "secret-never-in-ui", subscriptionType: "max" } });
+  await writeFile(join(home, ".credentials.json"), credentials);
+  const fetchApi = async (url, options) => {
+    assert.equal(url, "https://api.anthropic.com/api/oauth/usage?cedar_ember=1&skip_spend=1");
+    assert.equal(options.method, "GET");
+    assert.equal(options.headers.Authorization, "Bearer secret-never-in-ui");
+    assert.equal(options.redirect, "error");
+    return new Response(JSON.stringify({ seven_day: { utilization: 50, resets_at: null } }), { status: 200 });
+  };
+  assert.equal((await claudeQuota(home, fetchApi)).windows[0].label, "주간 한도");
+  await assert.rejects(claudeQuota(wrong, fetchApi), /인증 정보를 읽을/);
+  await assert.rejects(claudeQuota(home, async () => new Response("", { status: 401 })), error => error.status === "auth-required");
+  await assert.rejects(claudeQuota(home, async () => new Response("", { status: 429, headers: { "retry-after": "120" } })), error => error.retryAfterMs === 120000);
+  await assert.rejects(claudeQuota(home, async () => { throw Error("secret-never-in-ui"); }), error => !error.message.includes("secret-never"));
+  assert.equal(await readFile(join(home, ".credentials.json"), "utf8"), credentials);
+});
+
+test("Codex quota uses native account RPC and the selected process home", async t => {
+  const root = await temporary(t), command = join(root, "codex-fixture");
+  await writeFile(command, `#!/usr/bin/env node
+import {createInterface} from 'node:readline';
+createInterface({input:process.stdin}).on('line',line=>{
+ const value=JSON.parse(line);if(value.id===undefined)return;
+ if(!['initialize','account/read','account/rateLimits/read'].includes(value.method))throw Error('unexpected RPC');
+ const result=value.method==='initialize'?{}:value.method==='account/read'?{account:{type:'chatgpt',planType:'pro'}}:
+ {rateLimits:{primary:{usedPercent:process.env.CODEX_HOME.endsWith('B')?75:25,windowDurationMins:300}}};
+ console.log(JSON.stringify({id:value.id,result}));
+});
+`, { mode: 0o700 });
+  assert.equal((await codexQuota(command, { ...process.env, CODEX_HOME: join(root, "B") })).windows[0].usedPercent, 75);
+});
+
+test("quota cache deduplicates, expires at five minutes, retains stale values and honors backoff", async () => {
+  let now = 1000, calls = 0;
+  const cache = new QuotaCache(() => now);
+  const load = async () => { calls++; return limit(); };
+  assert.equal(cache.get("account", load).status, "loading");
+  cache.get("account", load, true);
+  await cache.settled();
+  assert.equal(calls, 1);
+  assert.equal(cache.get("account", load).status, "available");
+  now += 300000; cache.get("account", async () => { calls++; throw new QuotaError("error", "요청 제한", 120000); });
+  await cache.settled();
+  const stale = cache.get("account", load, true);
+  assert.equal(stale.status, "error"); assert.equal(stale.windows[0].usedPercent, 25); assert.equal(calls, 2);
+  now += 120000; cache.get("account", load, true); await cache.settled();
+  assert.equal(calls, 3); cache.stop();
+});
+
+test("native counters include cache once, deduplicate Claude messages and handle Codex resets", () => {
+  const claude = parseUsage([claudeLine("one", 2) + claudeLine("one", 4), claudeLine("one", 4) + claudeLine("two")], "claude");
+  assert.deepEqual(claude.totals, { inputTokens: 26, outputTokens: 8, cachedInputTokens: 6, cacheWriteInputTokens: 4 });
+  assert.equal(claude.complete, true);
+  const codex = parseUsage([codexLine(8, 4, 3) + codexLine(8, 4, 3) + codexLine(16, 8, 3) + codexLine(8, 4)], "codex");
+  assert.deepEqual(codex.totals, { inputTokens: 24, outputTokens: 12, cachedInputTokens: 3, cacheWriteInputTokens: 0 });
+  assert.equal(parseUsage(["{incomplete"], "claude").complete, false);
+});
+
+test("per-turn account attribution survives transfers, deferred switch, duplicate events, reload and identity changes", async t => {
+  const root = await temporary(t), adapters = createAdapters(), accounts = ["A", "B"].map(label => ({ id: randomUUID(), harness: "codex", label, createdAt: new Date().toISOString() }));
+  let newIdentity = false;
+  for (const harness of ["codex", "claude"]) {
+    adapters[harness].systemHome = join(root, "system-" + harness);
+    adapters[harness].quota = async () => limit();
+    adapters[harness].status = async home => ({ signedIn: harness === "codex", email: basename(home) + "@example.test",
+      identity: harness === "codex" ? basename(home) + (newIdentity && home.endsWith(accounts[1].id) ? "-new" : "") : null });
+  }
+  const agent = { id: "agent-one", provider: "codex", title: "테스트", status: "idle", activeTurn: null, persistence: { sessionId: randomUUID() } };
+  const paseo = { agents: { async list() { return { entries: [{ agent }], pageInfo: { hasMore: false, nextCursor: null } }; },
+    ref() { return { async refresh() { return { agent }; } }; } } };
+  let manager;
+  const restart = async () => { await manager.openSession({ agentId: agent.id, provider: "codex", cwd: root,
+    workspaceId: null, reason: "refresh", purpose: "interactive", env: {} }, paseo); };
+  manager = new AccountManager({ root: join(root, "accounts"), adapters, restart });
+  t.after(() => manager.dispose());
+  await manager.store.update(state => { state.accounts.push(...accounts); state.defaults.codex = accounts[0].id; });
+  const homeA = manager.profile(accounts[0]), path = join(homeA, "sessions", `rollout-test-${agent.persistence.sessionId}.jsonl`);
+  await mkdir(join(path, ".."), { recursive: true }); await writeFile(path, codexLine(60, 40)); // Existing CLI usage is baseline only.
+  await manager.store.update(state => { state.bindings[agent.id] = { harness: "codex", accountId: accounts[0].id, home: homeA, sessionId: agent.persistence.sessionId, identity: null, generation: "" }; });
+  await restart();
+  agent.status = "running"; agent.activeTurn = { turnId: "turn-a" };
+  await manager.beginTurn(agent.id, "turn-a", paseo);
+  await appendFile(path, codexLine(68, 44) + codexLine(76, 48));
+  await manager.change({ action: "select", harness: "codex", accountId: accounts[1].id }, paseo);
+  assert.equal((await manager.store.read()).bindings[agent.id].accountId, accounts[0].id);
+  agent.status = "idle"; agent.activeTurn = null; await manager.endTurn(agent.id, "turn-a", paseo);
+  await manager.endTurn(agent.id, "turn-a", paseo);
+  let snapshot = await manager.snapshot(paseo);
+  assert.equal(snapshot.accounts[0].metrics.statistics.totalTokens, 24);
+  assert.equal(snapshot.accounts[1].metrics.statistics.totalTokens, 0);
+  assert.equal(snapshot.accounts[0].metrics.isMostRecent, true);
+  const pathB = path.replace(homeA, manager.profile(accounts[1]));
+  agent.status = "running"; agent.activeTurn = { turnId: "turn-a" };
+  await manager.beginTurn(agent.id, "turn-a", paseo); await manager.beginTurn(agent.id, "turn-a", paseo);
+  await appendFile(pathB, codexLine(84, 52));
+  manager.dispose(); manager = new AccountManager({ root: join(root, "accounts"), adapters, restart });
+  agent.status = "idle"; agent.activeTurn = null; await manager.endTurn(agent.id, "turn-a", paseo);
+  snapshot = await manager.snapshot(paseo); SnapshotSchema.parse(snapshot);
+  assert.equal(snapshot.accounts[1].metrics.statistics.totalTokens, 12);
+  assert.equal(snapshot.accounts[1].metrics.statistics.turns, 1);
+  assert.equal(snapshot.accounts[1].metrics.statistics.incompleteTurns, 0);
+  assert.equal(snapshot.accounts[1].metrics.isMostRecent, true);
+  await manager.change({ action: "select", harness: "codex", accountId: accounts[0].id }, paseo);
+  assert.equal((await manager.snapshot(paseo)).accounts[1].metrics.isMostRecent, true); // Selection is not use.
+  newIdentity = true;
+  snapshot = await manager.snapshot(paseo);
+  assert.equal(snapshot.accounts[1].metrics.statistics.totalTokens, 0);
+  assert.equal(snapshot.accounts[1].metrics.isMostRecent, false);
+  const persisted = await readFile(join(manager.store.root, "metadata.json"), "utf8");
+  assert.equal(JSON.parse(persisted).version, 2);
+  assert.ok(!persisted.includes("access_token"));
+  assert.ok(!JSON.stringify(snapshot).includes("identity"));
+});
+
+test("version-one migration preserves account selection and rejects raw errors containing secrets", async t => {
+  const root = await temporary(t), id = randomUUID(), adapters = createAdapters();
+  for (const harness of ["codex", "claude"]) adapters[harness].status = async () => ({ signedIn: false, email: null, identity: null });
+  await writeFile(join(root, "metadata.json"), JSON.stringify({ version: 1,
+    accounts: [{ id, harness: "codex", label: "기존 계정", createdAt: new Date().toISOString() }],
+    defaults: { codex: id, claude: null }, overrides: {}, bindings: {}, pending: {} }));
+  const manager = new AccountManager({ root, adapters }); t.after(() => manager.dispose());
+  const paseo = { agents: { async list() { return { entries: [], pageInfo: { hasMore: false, nextCursor: null } }; } } };
+  const snapshot = await manager.snapshot(paseo);
+  assert.equal(snapshot.defaults.codex, id); assert.equal(snapshot.accounts[0].metrics.statistics.turns, 0);
+  const metadata = JSON.parse(await readFile(join(root, "metadata.json"), "utf8"));
+  assert.equal(metadata.version, 2); assert.ok(metadata.usage.startedAt);
+  assert.ok(!manager.publicError(Error("access_token secret-token")).includes("secret-token"));
+});
+
+test("Claude system-account turns include subagents, exclude old CLI records and retain partial usage on failure", async t => {
+  const root = await temporary(t), adapters = createAdapters();
+  for (const harness of ["codex", "claude"]) {
+    adapters[harness].systemHome = join(root, harness);
+    adapters[harness].status = async () => ({ signedIn: harness === "claude", email: harness === "claude" ? "outside@example.test" : null,
+      identity: harness === "claude" ? "claude-system-identity" : null });
+    adapters[harness].quota = async () => parseClaudeQuota({ five_hour: { utilization: 42 } });
+  }
+  const sessionId = randomUUID(), home = adapters.claude.systemHome;
+  const path = join(home, "projects", "-test", sessionId + ".jsonl");
+  await mkdir(join(path, ".."), { recursive: true }); await writeFile(path, claudeLine("old-cli"));
+  const agent = { id: "claude-agent", provider: "claude", title: "Claude", status: "idle", persistence: { sessionId }, activeTurn: null };
+  const paseo = { agents: { async list() { return { entries: [{ agent }], pageInfo: { hasMore: false, nextCursor: null } }; },
+    ref() { return { async refresh() { return { agent }; } }; } } };
+  const manager = new AccountManager({ root: join(root, "accounts"), adapters }); t.after(() => manager.dispose());
+  const opened = await manager.openSession({ agentId: agent.id, provider: "claude", cwd: root, workspaceId: null,
+    reason: "resume", purpose: "interactive", env: { PRESERVED: "yes" } }, paseo);
+  assert.equal(opened.env.PRESERVED, "yes");
+  agent.status = "running"; agent.activeTurn = { turnId: "claude-turn-0" };
+  await manager.beginTurn(agent.id, "claude-turn-0", paseo);
+  await appendFile(path, claudeLine("new-root", 2) + claudeLine("new-root", 4));
+  const child = join(home, "projects", "-test", sessionId, "subagents", "agent-child.jsonl");
+  await mkdir(join(child, ".."), { recursive: true }); await writeFile(child, claudeLine("new-child") + claudeLine("new-child"));
+  agent.status = "idle"; agent.activeTurn = null; await manager.endTurn(agent.id, "claude-turn-0", paseo);
+  let statistics = (await manager.snapshot(paseo)).systemAccounts.find(row => row.harness === "claude").metrics.statistics;
+  assert.equal(statistics.totalTokens, 34); assert.equal(statistics.inputTokens, 26);
+  assert.equal(statistics.cachedInputTokens, 6); assert.equal(statistics.cacheWriteInputTokens, 4);
+  assert.equal(statistics.turns, 1); assert.equal(statistics.incompleteTurns, 0);
+  agent.status = "running"; agent.activeTurn = { turnId: "claude-turn-1" };
+  await manager.beginTurn(agent.id, "claude-turn-1", paseo);
+  await appendFile(path, claudeLine("failed-request") + "{incomplete-tail");
+  agent.status = "error"; agent.activeTurn = null; await manager.endTurn(agent.id, "claude-turn-1", paseo);
+  await manager.endTurn(agent.id, "claude-turn-1", paseo);
+  statistics = (await manager.snapshot(paseo)).systemAccounts.find(row => row.harness === "claude").metrics.statistics;
+  assert.equal(statistics.totalTokens, 51); assert.equal(statistics.turns, 2); assert.equal(statistics.incompleteTurns, 1);
+});
+
+test("Codex metadata process aborts cleanly and does not expose child stderr", async t => {
+  const root = await temporary(t), command = join(root, "hanging-codex");
+  await writeFile(command, "#!/usr/bin/env node\nconsole.error('access_token secret-value');setInterval(()=>{},1000);\n", { mode: 0o700 });
+  const controller = new AbortController();
+  const running = codexQuota(command, { ...process.env }, controller.signal);
+  setTimeout(() => controller.abort(), 30);
+  await assert.rejects(running, error => !error.message.includes("secret-value") && error.status === "error");
+});
+
+test("an existing idle system session is primed before its first post-update turn", async t => {
+  const root = await temporary(t), adapters = createAdapters(), sessionId = randomUUID();
+  for (const harness of ["codex", "claude"]) {
+    adapters[harness].systemHome = join(root, harness);
+    adapters[harness].status = async () => ({ signedIn: harness === "codex", email: harness === "codex" ? "system@example.test" : null,
+      identity: harness === "codex" ? "system-codex" : null });
+    adapters[harness].quota = async () => limit();
+  }
+  const path = join(adapters.codex.systemHome, "sessions", `rollout-test-${sessionId}.jsonl`);
+  await mkdir(join(path, ".."), { recursive: true }); await writeFile(path, codexLine(60, 40));
+  const agent = { id: "existing-agent", provider: "codex", title: "기존 세션", status: "idle", activeTurn: null, persistence: { sessionId } };
+  const paseo = { agents: { async list() { return { entries: [{ agent }], pageInfo: { hasMore: false, nextCursor: null } }; },
+    ref() { return { async refresh() { return { agent }; } }; } } };
+  const manager = new AccountManager({ root: join(root, "accounts"), adapters }); t.after(() => manager.dispose());
+  await manager.snapshot(paseo);
+  agent.status = "running"; agent.activeTurn = { turnId: "codex-turn-7" };
+  await manager.beginTurn(agent.id, "codex-turn-7", paseo); await appendFile(path, codexLine(68, 44));
+  agent.status = "idle"; agent.activeTurn = null; await manager.endTurn(agent.id, "codex-turn-7", paseo);
+  const usage = (await manager.snapshot(paseo)).systemAccounts.find(row => row.harness === "codex").metrics;
+  assert.equal(usage.statistics.totalTokens, 12); assert.equal(usage.statistics.incompleteTurns, 0);
+  assert.equal(usage.isMostRecent, true);
+});

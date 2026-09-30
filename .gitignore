@@ -1,0 +1,11 @@
+node_modules/
+.test-build/
+*.tgz
+.env*
+*.log
+auth.json
+.credentials.json
+metadata.json
+harness-accounts/
+.codex/
+.claude/
