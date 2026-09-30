@@ -4,7 +4,7 @@ import { join, resolve } from "node:path";
 import { homedir } from "node:os";
 import { execFile, type ChildProcess } from "node:child_process";
 import { promisify } from "node:util";
-import type { PluginHandlerContext, PluginSessionOpenRequest } from "@getpaseo/plugin/server";
+import type { PluginHandlerContext, PluginSessionOpenRequest, PluginLifecycleEvents } from "@getpaseo/plugin/server";
 import { ActionSchema, HarnessSchema, emptyTokens, type Account, type Action, type Harness, type Snapshot, type State, type Metrics, type UsageCounter, type AccountSession, type Quota, type ResetOutcome, ResetOutcomeSchema, SessionSchema } from "../shared/accounts.js";
 import { createAdapters, type HarnessAdapter } from "./adapters.js";
 import { Store, privateDirectory, AccountError } from "./store.js";
@@ -13,9 +13,29 @@ import { nativeSessions } from "./sessions.js";
 
 type PaseoApi = PluginHandlerContext["paseo"];
 const execute = promisify(execFile);
+type TurnEnd = Pick<PluginLifecycleEvents["agent.turn_ended"], "outcome" | "timeline">;
+export function isUsageLimitFailure(event: TurnEnd): boolean {
+  if (event.outcome.kind === "canceled") return false;
+  const explicit = /usage_limit_reached|insufficient_quota|quota_exceeded|(?:usage|subscription|weekly|5.hour) (?:usage )?limit[^\n]{0,80}(?:reached|exceeded|exhausted)|you(?:['’]ve| have) (?:hit|reached) your (?:usage )?limit|사용량.{0,12}(?:소진|한도.{0,8}도달)/i;
+  if (event.outcome.kind === "failed") return explicit.test(`${event.outcome.error.code ?? ""} ${event.outcome.error.message}`);
+  const last = [...event.timeline].reverse().find(item => item.type === "assistant_message");
+  return last?.type === "assistant_message" && /^(?:you(?:['’]ve| have) (?:hit|reached) your (?:usage )?limit|(?:5.hour|weekly|usage) limit[^\n]{0,60}reached)/i.test(last.text.trim());
+}
+const RESUME_PROMPT = "사용량 한도로 중단된 이전 요청의 작업을 이어서 진행해 주세요. 이전 대화와 현재 파일 상태를 확인하고, 이미 완료한 변경이나 외부 작업을 반복하지 말고 미완료 부분부터 계속해 주세요.";
 const owns = (object: object, key: string) => Object.hasOwn(object, key);
 export function selectedAccount(state: State, harness: Harness, agentId: string): string | null {
   return owns(state.overrides, agentId) ? state.overrides[agentId] : state.defaults[harness];
+}
+function stopRotation(state: State, id: string, message: string) {
+  const job = state.rotations[id];
+  if (!job) return;
+  job.phase = "stopped"; job.message = message; job.updatedAt = new Date().toISOString();
+  if (state.pending[id]?.rotationKey !== job.failedKey) return;
+  delete state.pending[id];
+  if (state.bindings[id]?.accountId === job.fromAccountId && state.overrides[id] === job.targetAccountId) {
+    if (job.originalOverride === "inherit" || job.originalOverride && !state.accounts.some(account => account.id === job.originalOverride)) delete state.overrides[id];
+    else state.overrides[id] = job.originalOverride;
+  }
 }
 type AgentSummary = Awaited<ReturnType<PaseoApi["agents"]["list"]>>["entries"][number]["agent"];
 async function agentsOn(paseo: PaseoApi, archived = false): Promise<AgentSummary[]> {
@@ -38,6 +58,7 @@ export class AccountManager {
   private loginErrors = new Map<string, string>();
   private loginSlots = new Map<Harness, string>();
   private restarting = new Set<string>();
+  private rotating = new Set<string>();
   private disposed = false;
   private ready?: Promise<void>;
   private quotas = new QuotaCache();
@@ -71,6 +92,8 @@ export class AccountManager {
   async snapshot(paseo: PaseoApi, forceUsage = false): Promise<Snapshot> {
     await this.initialize();
     const [state, agents] = await Promise.all([this.store.read(), agentsOn(paseo)]);
+    for (const [id, job] of Object.entries(state.rotations)) if (state.rotation[job.harness] && ["checking", "switching", "sending"].includes(job.phase))
+      void this.driveRotation(id, paseo).catch(() => {});
     const identities = new Map<string, string>();
     const statisticsRows = new Map<string, string>();
     const metrics = (harness: Harness, id: string | null, signedIn: boolean, identity: string | null): Metrics => {
@@ -153,7 +176,7 @@ export class AccountManager {
     summary.totalTokens = summary.inputTokens + summary.outputTokens;
     return {
       summary,
-      accounts, systemAccounts, defaults: state.defaults,
+      accounts, systemAccounts, defaults: state.defaults, rotation: state.rotation,
       agents: agents.flatMap(agent => {
         const parsed = HarnessSchema.safeParse(agent.provider);
         if (!parsed.success || agent.archivedAt) return [];
@@ -164,6 +187,8 @@ export class AccountManager {
           desiredAccountId: selectedAccount(state, harness, agent.id),
           currentAccountId: state.bindings[agent.id]?.accountId ?? null,
           pending: owns(state.pending, agent.id), error: state.pending[agent.id]?.error ?? null,
+          rotation: state.rotations[agent.id] ? { phase: state.rotations[agent.id].phase,
+            message: state.rotations[agent.id].message, updatedAt: state.rotations[agent.id].updatedAt } : null,
         }];
       }),
     };
@@ -350,6 +375,28 @@ export class AccountManager {
   async change(input: Action, paseo: PaseoApi): Promise<{ message: string }> {
     await this.initialize();
     const action = ActionSchema.parse(input);
+    if (action.action === "set-rotation") {
+      await this.store.update(state => {
+        state.rotation[action.harness] = action.enabled;
+        if (!action.enabled) for (const [id, job] of Object.entries(state.rotations)) if (job.harness === action.harness && ["checking", "switching", "sending", "error"].includes(job.phase)) stopRotation(state, id, "자동 계정 전환을 껐습니다. 진행 중인 작업은 계속 실행됩니다.");
+      });
+      return { message: action.enabled ? "사용량 소진 시 같은 하네스의 다음 계정으로 전환하고 작업을 이어갑니다." : "자동 계정 전환을 껐습니다." };
+    }
+    if (action.action === "retry-rotation") {
+      const state = await this.store.read(), job = state.rotations[action.agentId];
+      if (!job || !state.rotation[job.harness]) throw new AccountError("자동 계정 전환을 켠 뒤 다시 시도하세요.");
+      if (!["error", "stopped"].includes(job.phase)) throw new AccountError("계정 전환 또는 작업이 이미 진행 중입니다.");
+      await this.store.update(next => {
+        const job = next.rotations[action.agentId];
+        if (job.targetAccountId === job.fromAccountId) {
+          job.triedRows = [this.row(job.harness, job.fromAccountId)];
+          const identity = next.bindings[action.agentId]?.identity; job.triedIdentities = identity ? [identity] : [];
+          job.phase = "checking";
+        } else job.phase = owns(next.pending, action.agentId) ? "switching" : "sending";
+      });
+      await this.driveRotation(action.agentId, paseo);
+      return { message: "자동 전환 결과를 다시 확인했습니다." };
+    }
     if (action.action === "cancel-system-login") {
       this.cancelLogin(this.row(action.harness, null));
       return { message: "시스템 계정 로그인을 취소했습니다." };
@@ -470,6 +517,9 @@ export class AccountManager {
     }
     const affected: string[] = [];
     await this.store.update(state => {
+      for (const [id, job] of Object.entries(state.rotations)) if (action.agentId ? id === action.agentId : action.action === "select" && job.harness === action.harness) {
+        stopRotation(state, id, "직접 선택한 계정을 사용합니다.");
+      }
       if (action.action === "inherit") delete state.overrides[action.agentId];
       else if (action.agentId) state.overrides[action.agentId] = action.accountId;
       else state.defaults[action.harness] = action.accountId;
@@ -546,7 +596,7 @@ export class AccountManager {
       if (!snapshot || snapshot.agent.archivedAt || !["idle", "error"].includes(snapshot.agent.status) || snapshot.agent.activeTurn) return;
       await this.restart(id);
     } catch (error) {
-      await this.store.update(state => { state.pending[id] = { error: this.publicError(error) }; });
+      await this.store.update(state => { state.pending[id] = { ...state.pending[id], error: this.publicError(error) }; });
     } finally { this.restarting.delete(id); }
   }
   async openSession(request: PluginSessionOpenRequest, paseo: PaseoApi): Promise<PluginSessionOpenRequest> {
@@ -600,6 +650,9 @@ export class AccountManager {
       const parsed = HarnessSchema.safeParse(snapshot?.agent.provider);
       if (!parsed.success || !snapshot) return;
       const harness = parsed.data, state = await this.store.read(), binding = state.bindings[id];
+      const rotation = state.rotations[id];
+      if (rotation && ["checking", "switching", "error"].includes(rotation.phase) && snapshot.agent.lastUserMessageAt !== rotation.lastUserMessageAt)
+        await this.store.update(next => stopRotation(next, id, "직접 입력한 새 요청을 유지하고 자동 전환을 중단했습니다."));
       const sessionId = snapshot.agent.persistence?.sessionId ?? binding?.sessionId ?? null;
       const providerTurnId = turnId ?? snapshot.agent.activeTurn?.turnId ?? null;
       // Native providers restart their local turn counter when the process is reloaded.
@@ -618,7 +671,7 @@ export class AccountManager {
           const previous = next.usage.active[id].identity;
           if (previous && next.usage.totals[previous]) next.usage.totals[previous].incompleteTurns++;
         }
-        next.usage.active[id] = { key, turnId: providerTurnId, row, identity: auth.identity, harness, home, native: accountId === null, sessionId, startedAt, baseline };
+        next.usage.active[id] = { key, turnId: providerTurnId, row, identity: auth.identity, harness, home, native: accountId === null, sessionId, startedAt, baseline, lastUserMessageAt: snapshot.agent.lastUserMessageAt ?? null };
         if (auth.identity) {
           const totals = next.usage.totals[auth.identity] ??= { ...emptyTokens(), turns: 0, incompleteTurns: 0, lastUsedAt: null };
           totals.turns++; totals.lastUsedAt = startedAt; next.usage.identities[row] = auth.identity;
@@ -629,7 +682,8 @@ export class AccountManager {
       });
     });
   }
-  endTurn(id: string, turnId: string | null, paseo: PaseoApi) {
+  endTurn(id: string, turnId: string | null, paseo: PaseoApi, event?: TurnEnd) {
+    let rotationNeeded = false;
     return this.serialTurn(id, async () => {
       await this.initialize();
       const state = await this.store.read(), active = state.usage.active[id];
@@ -664,7 +718,133 @@ export class AccountManager {
         } else delete next.usage.prepared[id];
         next.usage.finished[id] = active.key; delete next.usage.active[id];
       });
-    }).finally(() => this.applyPending(id, paseo));
+      if (event && sessionId) rotationNeeded = await this.prepareRotation(id, active, sessionId, event, snapshot?.agent.lastUserMessageAt ?? null);
+    }).then(async () => {
+      if (rotationNeeded) await this.driveRotation(id, paseo);
+      else await this.applyPending(id, paseo);
+    });
+  }
+  private async prepareRotation(id: string, active: State["usage"]["active"][string], sessionId: string, event: TurnEnd, lastUserMessageAt: string | null) {
+    const state = await this.store.read(), previous = state.rotations[id];
+    if (!state.rotation[active.harness] || owns(state.pending, id)) return false;
+    let exhausted = isUsageLimitFailure(event);
+    if (!exhausted && event.outcome.kind === "failed" && /rate_limit|too many requests|\b429\b/i.test(`${event.outcome.error.code ?? ""} ${event.outcome.error.message}`)) {
+      try { exhausted = (await this.adapters[active.harness].quota(active.home, active.native)).windows.some(window => window.usedPercent >= 100); } catch { /* A transient 429 alone is not quota exhaustion. */ }
+    }
+    if (!exhausted) {
+      if (previous && ["continued", "sending"].includes(previous.phase)) await this.store.update(next => {
+        const job = next.rotations[id]; job.phase = event.outcome.kind === "completed" ? "completed" : "stopped";
+        job.message = event.outcome.kind === "completed" ? "자동 계정 전환 후 작업을 완료했습니다." : "작업이 중단되었습니다. 자동 계정 전환을 종료했습니다.";
+        job.updatedAt = new Date().toISOString();
+      });
+      return false;
+    }
+    // A completed Claude turn can carry the native limit message. Confirm its actual quota first.
+    if (event.outcome.kind === "completed") {
+      try { if (!(await this.adapters[active.harness].quota(active.home, active.native)).windows.some(window => window.usedPercent >= 100)) return false; }
+      catch { return false; }
+    }
+    const lastUser = [...event.timeline].reverse().find(item => item.type === "user_message");
+    const messageId = lastUser?.type === "user_message" ? lastUser.clientMessageId ?? lastUser.messageId : null;
+    const continues = previous && (messageId === previous.messageId || !messageId && ["sending", "continued"].includes(previous.phase));
+    const fromAccountId = state.bindings[id]?.accountId ?? null;
+    await this.store.update(next => {
+      if (!next.rotation[active.harness] || owns(next.pending, id)) return;
+      next.rotations[id] = { harness: active.harness, sessionId, failedKey: active.key, phase: "checking", fromAccountId, targetAccountId: fromAccountId, originalOverride: owns(state.overrides, id) ? state.overrides[id] : "inherit",
+        triedRows: [...new Set([...(continues ? previous.triedRows : []), this.row(active.harness, fromAccountId)])],
+        triedIdentities: [...new Set([...(continues ? previous.triedIdentities : []), ...(active.identity ? [active.identity] : [])])],
+        messageId: randomUUID(), lastUserMessageAt, updatedAt: new Date().toISOString(), message: "사용량 한도를 확인하고 다음 계정을 찾고 있습니다." };
+    });
+    return true;
+  }
+  private async rotationMessage(id: string, phase: State["rotations"][string]["phase"], message: string) {
+    await this.store.update(state => { const job = state.rotations[id]; if (phase === "stopped") { stopRotation(state, id, message); return; } if (job) { job.phase = phase; job.message = message; job.updatedAt = new Date().toISOString(); } });
+  }
+  async driveRotation(id: string, paseo: PaseoApi) {
+    if (this.disposed || this.rotating.has(id)) return;
+    this.rotating.add(id);
+    let expectedKey: string | null = null;
+    try {
+      let state = await this.store.read(), job = state.rotations[id];
+      if (!job || !state.rotation[job.harness] || !["checking", "switching", "sending"].includes(job.phase)) return;
+      const handle = paseo.agents.ref(id), current = await handle.refresh();
+      expectedKey = job.failedKey;
+      if (job.phase === "sending") {
+        // A missing acknowledgement may still mean the provider accepted our persisted message ID.
+        const history = await handle.timeline.refetch({ direction: "tail", projection: "canonical", limit: 100 });
+        const received = history.entries.some(entry => entry.item.type === "user_message" &&
+          (entry.item.clientMessageId === job.messageId || entry.item.messageId === job.messageId));
+        if (received) {
+          await this.rotationMessage(id, current?.agent.activeTurn ? "continued" : "completed", "재개 요청이 이미 전달되었습니다. 추가 요청 없이 기존 작업을 유지합니다."); return;
+        }
+      }
+      if (!current || current.agent.archivedAt || current.agent.status === "closed" || current.agent.activeTurn || current.agent.pendingPermissions?.length ||
+        current.agent.lastUserMessageAt !== job.lastUserMessageAt || current.agent.persistence?.sessionId !== job.sessionId) {
+        await this.rotationMessage(id, "stopped", "세션 상태가 변경되어 자동 전환을 중단했습니다. 현재 작업 또는 직접 입력한 요청을 유지합니다."); return;
+      }
+      if (job.phase === "checking") {
+        const adapter = this.adapters[job.harness];
+        const rows = [null, ...state.accounts.filter(account => account.harness === job.harness).map(account => account.id)];
+        const position = rows.indexOf(job.fromAccountId), ordered = [...rows.slice(position + 1), ...rows.slice(0, position + 1)];
+        let chosen: { id: string | null; identity: string; label: string } | null = null;
+        for (const accountId of ordered) {
+          const row = this.row(job.harness, accountId);
+          if (job.triedRows.includes(row) || this.jobs.has(row)) continue;
+          const account = accountId ? this.account(state, accountId) : null, home = account ? this.profile(account) : adapter.systemHome;
+          try {
+            const auth = await adapter.status(home, account === null);
+            if (!auth.signedIn || !auth.identity || job.triedIdentities.includes(auth.identity)) continue;
+            try {
+              const quota = await adapter.quota(home, account === null);
+              this.quotas.put(`${row}:${auth.identity}`, quota);
+              if (quota.status === "auth-required" || quota.windows.some(window => window.usedPercent >= 100 && (!window.resetsAt || Date.parse(window.resetsAt) > Date.now()))) continue;
+            } catch (error) { if (error instanceof QuotaError && error.status === "auth-required") continue; }
+            chosen = { id: accountId, identity: auth.identity, label: account?.label ?? "시스템 계정" }; break;
+          } catch { /* An unavailable or unsafe profile is never selected. */ }
+        }
+        const beforeSwitch = await paseo.agents.ref(id).refresh();
+        if (!beforeSwitch || beforeSwitch.agent.activeTurn || beforeSwitch.agent.pendingPermissions?.length || beforeSwitch.agent.archivedAt ||
+          !["idle", "error"].includes(beforeSwitch.agent.status) || beforeSwitch.agent.lastUserMessageAt !== job.lastUserMessageAt) {
+          await this.rotationMessage(id, "stopped", "새 작업 또는 입력을 확인해 자동 전환을 중단했습니다."); return;
+        }
+        if (!chosen) { await this.rotationMessage(id, "stopped", "같은 하네스에 사용할 수 있는 다음 계정이 없습니다. 계정을 추가하거나 한도 초기화를 기다리세요."); return; }
+        await this.store.update(next => {
+          const job = next.rotations[id];
+          if (!job || job.failedKey !== expectedKey || job.phase !== "checking" || !next.rotation[job.harness] || owns(next.pending, id)) return;
+          job.targetAccountId = chosen!.id; job.triedRows.push(this.row(job.harness, chosen!.id)); job.triedIdentities.push(chosen!.identity);
+          job.phase = "switching"; job.message = `${chosen!.label} 계정으로 전환하고 있습니다.`; job.updatedAt = new Date().toISOString();
+          next.overrides[id] = chosen!.id; next.pending[id] = { error: null, rotationKey: expectedKey! };
+        });
+      }
+      state = await this.store.read(); job = state.rotations[id];
+      if (job.failedKey !== expectedKey || !state.rotation[job.harness] || !["switching", "sending"].includes(job.phase)) return;
+      if (job.phase === "switching") await this.applyPending(id, paseo);
+      state = await this.store.read(); job = state.rotations[id];
+      if (job.failedKey !== expectedKey || !state.rotation[job.harness] || !["switching", "sending"].includes(job.phase)) return;
+      const refreshed = await paseo.agents.ref(id).refresh(), binding = state.bindings[id];
+      if (owns(state.pending, id) || binding?.accountId !== job.targetAccountId || binding.sessionId !== job.sessionId)
+        throw new AccountError("계정 전환을 완료하지 못했습니다. 대화 기록을 보존했습니다. 자동 전환을 다시 시도하세요.");
+      if (!refreshed || refreshed.agent.archivedAt || !["idle", "error"].includes(refreshed.agent.status) || refreshed.agent.activeTurn || refreshed.agent.pendingPermissions?.length ||
+        refreshed.agent.persistence?.sessionId !== job.sessionId || refreshed.agent.lastUserMessageAt !== job.lastUserMessageAt) {
+        await this.rotationMessage(id, "stopped", "새 작업 또는 입력을 확인해 자동 재개를 중단했습니다."); return;
+      }
+      await this.rotationMessage(id, "sending", "계정을 전환했습니다. 이전 대화에서 중단된 작업을 재개하고 있습니다.");
+      // Reuse the persisted message ID: Paseo's durable delivery receipt prevents duplicate continuation prompts.
+      const confirmed = await this.store.read();
+      if (!confirmed.rotation[job.harness] || confirmed.rotations[id]?.phase !== "sending" || confirmed.rotations[id]?.failedKey !== expectedKey) return;
+      const options = { messageId: job.messageId, activeTurnBehavior: "steer" as const };
+      await paseo.agents.ref(id).send(RESUME_PROMPT, options);
+      await this.store.update(next => { const job = next.rotations[id]; if (job?.failedKey === expectedKey && job.phase === "sending") {
+        job.phase = "continued"; job.message = "같은 하네스의 다음 계정에서 작업을 이어서 실행 중입니다."; job.updatedAt = new Date().toISOString();
+      } });
+    } catch {
+      if ((await this.store.read()).rotations[id]?.failedKey === expectedKey) await this.rotationMessage(id, "error", "자동 전환 또는 재개 결과를 확인하지 못했습니다. 대화 기록은 유지됩니다. 같은 요청으로 다시 확인하세요.");
+    } finally {
+      this.rotating.delete(id);
+      // A replacement turn can fail before send() acknowledges it. Continue its next hop after releasing this lock.
+      const next = (await this.store.read()).rotations[id];
+      if (!this.disposed && next?.phase === "checking") void this.driveRotation(id, paseo);
+    }
   }
   dispose() {
     this.disposed = true;

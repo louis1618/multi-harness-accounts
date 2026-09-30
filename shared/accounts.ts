@@ -61,11 +61,21 @@ const CounterSchema = z.object({
   totals: TokenTotalsSchema, observed: z.boolean(), complete: z.boolean(),
 }).strict();
 export type UsageCounter = z.infer<typeof CounterSchema>;
+const RotationSettingsSchema = z.object({ codex: z.boolean(), claude: z.boolean() }).strict().default({ codex: false, claude: false });
+const RotationPhaseSchema = z.enum(["checking", "switching", "sending", "continued", "completed", "stopped", "error"]);
 export const StateSchema = z.object({
   version: z.literal(2).default(2),
   accounts: z.array(AccountSchema).default([]),
   defaults: z.object({ codex: AccountIdSchema.nullable(), claude: AccountIdSchema.nullable() })
     .default({ codex: null, claude: null }),
+  rotation: RotationSettingsSchema,
+  rotations: z.record(AgentIdSchema, z.object({
+    harness: HarnessSchema, sessionId: z.string(), failedKey: z.string(), phase: RotationPhaseSchema,
+    fromAccountId: AccountIdSchema.nullable(), targetAccountId: AccountIdSchema.nullable(),
+    originalOverride: z.union([AccountIdSchema, z.literal("inherit"), z.null()]),
+    triedRows: z.array(z.string()), triedIdentities: z.array(z.string()), messageId: z.string().uuid(),
+    lastUserMessageAt: z.string().nullable(), updatedAt: z.string().datetime(), message: z.string(),
+  }).strict()).default({}),
   overrides: z.record(AgentIdSchema, AccountIdSchema.nullable()).default({}),
   bindings: z.record(AgentIdSchema, z.object({
     harness: HarnessSchema, accountId: AccountIdSchema.nullable(), home: z.string().min(1),
@@ -73,7 +83,7 @@ export const StateSchema = z.object({
     identity: z.string().nullable().default(null),
     generation: z.string().default(""),
   }).strict()).default({}),
-  pending: z.record(AgentIdSchema, z.object({ error: z.string().nullable() }).strict()).default({}),
+  pending: z.record(AgentIdSchema, z.object({ error: z.string().nullable(), rotationKey: z.string().optional() }).strict()).default({}),
   resetAttempts: z.record(z.string(), z.object({
     id: z.string().uuid(), accountId: AccountIdSchema.nullable(), identity: z.string(), harness: HarnessSchema.default("codex"),
     createdAt: z.string().datetime(), stage: z.enum(["prepared", "pending", "complete"]),
@@ -92,7 +102,7 @@ export const StateSchema = z.object({
     active: z.record(AgentIdSchema, z.object({
       key: z.string(), turnId: z.string().nullable().default(null), row: z.string(), identity: z.string().nullable(), harness: HarnessSchema,
       home: z.string(), native: z.boolean(), sessionId: z.string().nullable(),
-      startedAt: z.string().datetime(), baseline: CounterSchema.nullable(),
+      startedAt: z.string().datetime(), baseline: CounterSchema.nullable(), lastUserMessageAt: z.string().nullable().default(null),
     }).strict()).default({}),
     mostRecentRow: z.string().nullable().default(null),
     mostRecentIdentity: z.string().nullable().default(null),
@@ -119,6 +129,8 @@ export const ActionSchema = z.discriminatedUnion("action", [
   z.object({ action: z.literal("inherit"), agentId: AgentIdSchema }).strict(),
   z.object({ action: z.literal("retry"), agentId: AgentIdSchema }).strict(),
   z.object({ action: z.literal("refresh-usage") }).strict(),
+  z.object({ action: z.literal("set-rotation"), harness: HarnessSchema, enabled: z.boolean() }).strict(),
+  z.object({ action: z.literal("retry-rotation"), agentId: AgentIdSchema }).strict(),
   z.object({ action: z.literal("relogin-system"), harness: HarnessSchema, confirmed: z.literal(true) }).strict(),
   z.object({ action: z.literal("logout-system"), harness: HarnessSchema, confirmed: z.literal(true) }).strict(),
   z.object({ action: z.literal("cancel-system-login"), harness: HarnessSchema }).strict(),
@@ -136,12 +148,14 @@ export const SnapshotSchema = z.object({
     metrics: MetricsSchema,
   }).strict()),
   defaults: StateSchema.shape.defaults,
+  rotation: RotationSettingsSchema,
   summary: StatisticsSchema.extend({ accountCount: z.number().int().nonnegative() }).strict(),
   agents: z.array(z.object({
     id: AgentIdSchema, title: z.string(), harness: HarnessSchema, status: z.string(),
     override: z.union([AccountIdSchema, z.literal("inherit"), z.literal("system")]),
     desiredAccountId: AccountIdSchema.nullable(), currentAccountId: AccountIdSchema.nullable(),
     pending: z.boolean(), error: z.string().nullable(),
+    rotation: z.object({ phase: RotationPhaseSchema, message: z.string(), updatedAt: z.string().datetime() }).strict().nullable().default(null),
   }).strict()),
 }).strict();
 export type Snapshot = z.infer<typeof SnapshotSchema>;

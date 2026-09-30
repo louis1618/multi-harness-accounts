@@ -1,6 +1,6 @@
 import { useRpc, type PluginSurfaceProps, type PluginAgentPanelProps } from "@getpaseo/plugin/client";
 import { Icon, Modal, TextInput, ScrollView as SheetScrollView } from "@getpaseo/plugin/client/react-native";
-import { SettingsInput, SettingsSelect } from "@getpaseo/plugin/client/ui";
+import { SettingsInput, SettingsSelect, SettingsSwitch } from "@getpaseo/plugin/client/ui";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useState, type ReactNode } from "react";
 import { ActivityIndicator, Image, Pressable, ScrollView, Text, View } from "react-native";
@@ -165,7 +165,7 @@ export function AccountsSurface({ theme, layout, initialAgentId }: PluginSurface
   useEffect(() => { const timer = setInterval(() => setNow(Date.now()), 30000); return () => clearInterval(timer); }, []);
   const query = useQuery({ queryKey: ["accounts"], queryFn: () => list({}),
     refetchInterval: query => [...(query.state.data?.accounts ?? []), ...(query.state.data?.systemAccounts ?? [])]
-      .some(row => row.status === "authenticating" || row.metrics.quota.status === "loading") || query.state.data?.agents.some(agent => agent.pending) ? 3000 : 30000 });
+      .some(row => row.status === "authenticating" || row.metrics.quota.status === "loading") || query.state.data?.agents.some(agent => agent.pending || agent.rotation && ["checking", "switching", "sending"].includes(agent.rotation.phase)) ? 3000 : 30000 });
   const mutation = useMutation({ mutationFn: (input: Action) => change(input), onMutate: () => setNotice(""),
     onSettled: () => queryClient.invalidateQueries({ queryKey: ["accounts"] }) });
   const sessionsQuery = useQuery({ queryKey: ["account-sessions"], enabled: picking, queryFn: () => fetchSessions({ refresh: true }), staleTime: 0 });
@@ -231,6 +231,15 @@ export function AccountsSurface({ theme, layout, initialAgentId }: PluginSurface
             <Button colors={colors} icon="Plus" disabled={busy || rows.some(row => row.harness === harness && row.status === "authenticating")}
               onPress={() => { mutation.reset(); setLabel(""); setAdding(harness); }}>계정 추가</Button>
           </ServiceHeader>
+          <SettingsSwitch label="사용량 소진 시 자동 계정 전환" value={data.rotation[harness]} disabled={busy}
+            hint="같은 하네스의 다음 로그인 계정으로 전환해 중단된 작업을 이어갑니다. 기본 계정은 유지하며 리셋권을 사용하지 않습니다."
+            onValueChange={enabled => mutation.mutate({ action: "set-rotation", harness, enabled })} />
+          {data.agents.filter(agent => agent.harness === harness && agent.rotation).map(agent => <View key={agent.id} style={{ gap: 8 }}>
+            <Text accessibilityLiveRegion="polite" style={detail}>{agent.title} · {agent.rotation!.message}</Text>
+            {["error", "stopped"].includes(agent.rotation!.phase) && data.rotation[harness] && <View style={{ flexDirection: "row" }}>
+              <Button colors={colors} disabled={busy} onPress={() => mutation.mutate({ action: "retry-rotation", agentId: agent.id })}>자동 전환 다시 확인</Button>
+            </View>}
+          </View>)}
           {rows.filter(row => row.harness === harness).map(row => <View key={row.id ?? "system"} style={{
             backgroundColor: colors.surface1, borderWidth: 1, borderColor: colors.border, borderRadius: 12, padding: layout.compact ? 18 : 22, gap: 18 }}>
             <View style={{ flexDirection: "row", flexWrap: "wrap", alignItems: "flex-start", justifyContent: "space-between", gap: 16 }}>

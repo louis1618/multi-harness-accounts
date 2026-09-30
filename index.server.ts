@@ -15,7 +15,7 @@ export default function contribute(server: PluginServerContext) {
   server.handle(consumeReset, input => safe(manager.consumeReset(input.attemptId, input.creditId, input.confirmed)));
   server.before("agent.session_open", ({ request }, { paseo }) => safe(manager.openSession(request, paseo)));
   server.on("agent.turn_started", ({ agent, turnId }, { paseo }) => safe(manager.beginTurn(agent.id, turnId, paseo)));
-  server.on("agent.turn_ended", ({ agent, turnId }, { paseo }) => safe(manager.endTurn(agent.id, turnId, paseo)));
+  server.on("agent.turn_ended", ({ agent, turnId, outcome, timeline }, { paseo }) => safe(manager.endTurn(agent.id, turnId, paseo, { outcome, timeline })));
   server.on("agent.created", ({ agent }, { paseo }) => safe(manager.prepareCreatedAgent(agent.id, paseo)));
   return () => manager.dispose();
 }
