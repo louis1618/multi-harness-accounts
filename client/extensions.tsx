@@ -146,7 +146,7 @@ export function ExtensionsPanel({
     [selected, setSelected] = useState<string[]>([]),
     [advanced, setAdvanced] = useState(false);
   const [dialog, setDialog] = useState<
-      "add" | "apply" | "detail" | "settings" | null
+      "add" | "apply" | "detail" | "settings" | "history" | null
     >(null),
     [item, setItem] = useState<ExtensionItem | null>(null),
     [remove, setRemove] = useState(false),
@@ -279,468 +279,389 @@ export function ExtensionsPanel({
         j.status !== "canceled" &&
         j.steps.some((s) => s.action !== "skip"),
     )
-    .slice(-3)
+    .slice(-15)
     .reverse();
+  const card = {
+    backgroundColor: c.surface1,
+    borderWidth: 1,
+    borderColor: c.border,
+    borderRadius: 14,
+    padding: layout.compact ? 16 : 22,
+    gap: 18,
+  };
+  const needsAttention = relevant.some((j) =>
+    ["error", "approval"].includes(j.status),
+  );
+  const hasActiveChange = relevant.some((j) =>
+    ["waiting", "running"].includes(j.status),
+  );
   return (
-    <View style={{ gap: 24 }}>
-      <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 12 }}>
-        {(["codex", "claude"] as const).map((h) => (
-          <Pressable
-            key={h}
-            accessibilityRole="button"
-            disabled={busy}
-            accessibilityState={{ selected: h === harness }}
-            onPress={() => {
-              setHarness(h);
-              setAccountId(null);
-              setScope("user");
-              setSessionId(null);
-            }}
-            style={({ pressed }) => ({
-              flexDirection: "row",
-              alignItems: "center",
-              gap: 10,
-              minHeight: 56,
-              paddingHorizontal: 14,
-              borderRadius: 10,
-              borderWidth: 1,
-              borderColor: h === harness ? c.accent : c.border,
-              backgroundColor: pressed ? c.surface2 : c.surface1,
-            })}
-          >
-            <Image
-              source={{ uri: serviceLogos[h] }}
-              style={{ width: 30, height: 30 }}
-              resizeMode="contain"
-            />
-            <Text
-              style={{ color: c.foreground, fontWeight: "600", fontSize: 17 }}
-            >
-              {harnessLabels[h]}
-            </Text>
-          </Pressable>
-        ))}
-      </View>
-      <SettingsSelect
-        label="관리할 계정"
-        value={accountId ?? "system"}
-        options={rows.map((r) => ({
-          value: r.id ?? "system",
-          label: `${r.label}${r.status === "authenticating" ? " · 로그인 중" : ""}`,
-        }))}
-        onValueChange={(v) => setAccountId(v === "system" ? null : v)}
-        disabled={busy}
-      />
-      <View
-        style={{
-          flexDirection: "row",
-          flexWrap: "wrap",
-          justifyContent: "space-between",
-          alignItems: "center",
-          gap: 12,
-        }}
-      >
-        <View style={{ flexDirection: "row", gap: 20 }}>
-          {[false, true].map((v) => (
-            <Pressable
-              key={String(v)}
-              accessibilityRole="tab"
-              accessibilityState={{ selected: common === v }}
-              aria-selected={common === v}
-              onPress={() => setCommon(v)}
-              style={{
-                minHeight: 44,
-                justifyContent: "center",
-                borderBottomWidth: 2,
-                borderBottomColor: common === v ? c.accent : "transparent",
-              }}
-            >
-              <Text
-                style={{
-                  color: common === v ? c.foreground : c.foregroundMuted,
-                  fontSize: 16,
-                  fontWeight: "600",
+    <View style={{ gap: 20 }}>
+      <View style={card}>
+        <View
+          style={{
+            flexDirection: "row",
+            flexWrap: "wrap",
+            gap: 12,
+            alignItems: "center",
+            justifyContent: "space-between",
+          }}
+        >
+          <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 12 }}>
+            {(["codex", "claude"] as const).map((h) => (
+              <Pressable
+                key={h}
+                accessibilityRole="button"
+                disabled={busy}
+                accessibilityState={{ selected: h === harness }}
+                onPress={() => {
+                  setHarness(h);
+                  setAccountId(null);
+                  setScope("user");
+                  setSessionId(null);
                 }}
+                style={({ pressed }) => ({
+                  flexDirection: "row",
+                  alignItems: "center",
+                  gap: 10,
+                  minHeight: 56,
+                  paddingHorizontal: 14,
+                  borderRadius: 10,
+                  borderWidth: 1,
+                  borderColor: h === harness ? c.accent : c.border,
+                  backgroundColor: pressed ? c.surface2 : c.surface1,
+                })}
               >
-                {v ? "공통 구성" : "설치된 항목"}
-              </Text>
-            </Pressable>
-          ))}
-        </View>
-        <Button
-          colors={c}
-          icon={common ? "CopyPlus" : "Plus"}
-          disabled={busy || (common && !query.data?.common.length)}
-          onPress={() => {
-            op.reset();
-            setPlan(null);
-            if (common) {
-              setTargets([accountId ?? "system"]);
-              setReplacements([]);
-              setDialog("apply");
-            } else {
-              setName("");
-              setValue("");
-              setKind(
-                harness === "codex" && scope !== "user" ? "skill" : "plugin",
-              );
-              setDialog("add");
-            }
-          }}
-        >
-          {common ? "계정에 적용" : "추가"}
-        </Button>
-      </View>
-      {common && (
-        <Text style={body}>
-          이 계정의 실제 설치 상태를 함께 표시합니다. 공통 구성 저장 후 다른
-          계정에는 ‘계정에 적용’을 눌러 설치하세요.
-        </Text>
-      )}
-      {!common && missingCommon.length > 0 && (
-        <View style={{ gap: 10 }}>
-          <Text style={body}>
-            이 계정에 아직 설치하지 않은 공통 항목이 {missingCommon.length}개
-            있습니다.
-          </Text>
-          <View style={{ alignItems: "flex-start" }}>
-            <Button colors={c} disabled={busy} onPress={startApply}>
-              빠진 공통 항목 설치
-            </Button>
+                <Image
+                  source={{ uri: serviceLogos[h] }}
+                  style={{ width: 30, height: 30 }}
+                  resizeMode="contain"
+                />
+                <Text
+                  style={{
+                    color: c.foreground,
+                    fontWeight: "600",
+                    fontSize: 17,
+                  }}
+                >
+                  {harnessLabels[h]}
+                </Text>
+              </Pressable>
+            ))}
           </View>
-        </View>
-      )}
-      {!common && (
-        <View
-          style={{
-            flexDirection: "row",
-            flexWrap: "wrap",
-            gap: 8,
-            alignItems: "center",
-          }}
-        >
-          <TextInput
-            accessibilityLabel="설치 항목 검색"
-            placeholder="항목 검색"
-            placeholderTextColor={c.foregroundMuted}
-            value={search}
-            onChangeText={setSearch}
-            style={{
-              flexGrow: 1,
-              flexBasis: 200,
-              color: c.foreground,
-              backgroundColor: c.surface1,
-              borderColor: c.border,
-              borderWidth: 1,
-              borderRadius: 8,
-              padding: 12,
-              fontSize: 16,
-            }}
-          />
-          <View style={{ width: 350, maxWidth: "100%" }}>
-            <SettingsSelect
-              label="종류"
-              value={filter}
-              options={[
-                { value: "all", label: "전체" },
-                ...Object.entries(kinds).map(([value, label]) => ({
-                  value,
-                  label,
-                })),
-              ]}
-              onValueChange={setFilter}
-            />
-          </View>
-        </View>
-      )}
-      {query.isFetching && (
-        <ActivityIndicator
-          accessibilityLabel="설치 목록 조회 중"
-          color={c.accent}
-        />
-      )}
-      {(query.error || op.error) && (
-        <Text
-          accessibilityRole="alert"
-          style={{ ...body, color: c.statusDanger }}
-        >
-          {message((op.error ?? query.error)!)}
-        </Text>
-      )}
-      {!!notice && (
-        <Text accessibilityLiveRegion="polite" style={body}>
-          {notice}
-        </Text>
-      )}
-      {!!selected.length && (
-        <View
-          style={{
-            flexDirection: "row",
-            flexWrap: "wrap",
-            gap: 10,
-            alignItems: "center",
-          }}
-        >
-          <Text style={body}>{selected.length}개 선택</Text>
           <Button
             colors={c}
-            disabled={busy}
-            onPress={() =>
-              op.mutate(async () => {
-                await save({ target, keys: selected, remove: common });
-                setSelected([]);
-                setNotice(
-                  common
-                    ? "공통 구성에서 제외했습니다. 설치된 항목은 유지됩니다."
-                    : "공통 구성을 저장했습니다. 다른 계정에는 ‘계정에 적용’을 눌러 설치하세요.",
-                );
-              })
-            }
-          >
-            {common ? "공통 구성에서 제외" : "공통 구성으로 저장"}
-          </Button>
-          <Button colors={c} onPress={() => setSelected([])}>
-            선택 해제
-          </Button>
-        </View>
-      )}
-      <View style={{ borderTopWidth: 1, borderColor: c.border }}>
-        {items.length === 0 && !query.isFetching && (
-          <View style={{ paddingVertical: 32, gap: 8 }}>
-            <Text
-              style={{ color: c.foreground, fontSize: 17, fontWeight: "600" }}
-            >
-              {common ? "아직 공통 구성이 없습니다" : "표시할 항목이 없습니다"}
-            </Text>
-            <Text style={body}>
-              {common
-                ? "설치된 항목에서 함께 사용할 항목을 선택해 저장하세요."
-                : "다른 계정을 선택하거나 필요한 항목을 추가하세요."}
-            </Text>
-          </View>
-        )}
-        {items.map((r, i) => (
-          <View
-            key={`${r.key}:${r.scope}:${i}`}
-            style={{
-              flexDirection: "row",
-              alignItems: "center",
-              gap: 12,
-              paddingVertical: 12,
-              borderBottomWidth: 1,
-              borderColor: c.border,
+            icon="History"
+            onPress={() => {
+              op.reset();
+              setDialog("history");
+              void jobs.refetch();
             }}
           >
-            <Check
-              showLabel={false}
-              label={`${r.name} 선택`}
-              checked={selected.includes(r.key)}
-              colors={c}
-              onPress={() => setSelected(toggle(selected, r.key))}
-            />
-            <View style={{ flex: 1, minWidth: 0, gap: 5 }}>
-              <Text
-                selectable
-                style={{ color: c.foreground, fontSize: 16, fontWeight: "500" }}
-              >
-                {r.name}
-              </Text>
-              <Text style={{ ...body, fontSize: 13 }}>
-                {[
-                  kinds[r.kind],
-                  r.version,
-                  r.common && !common ? "공통 구성" : null,
-                  common
-                    ? r.installation === "missing"
-                      ? "이 계정에 미설치"
-                      : r.installation === "different"
-                        ? "설치됨 · 공통 구성과 다름"
-                        : r.installation === "installed" ? "이 계정에 설치됨" : "설치 상태 확인 중"
-                    : null,
-                  !r.enabled ? "비활성" : null,
-                  r.scope === "host"
-                    ? "호스트 공통"
-                    : r.scope !== scope
-                      ? r.scope === "user"
-                        ? "계정 범위"
-                        : "프로젝트 범위"
-                      : null,
-                  r.authNeeded ? "인증 값 확인 필요" : null,
-                ]
-                  .filter(Boolean)
-                  .join(" · ")}
-              </Text>
-            </View>
-            {!common && (
-              <Button
-                colors={c}
-                icon="ChevronRight"
-                onPress={() => {
-                  op.reset();
-                  setItem(r);
-                  setValue("");
-                  setEditing(false);
-                  setRemove(false);
-                  setDialog("detail");
+            최근 변경
+            {needsAttention
+              ? " · 확인 필요"
+              : hasActiveChange
+                ? " · 적용 중"
+                : ""}
+          </Button>
+        </View>
+        <SettingsSelect
+          label="관리할 계정"
+          value={accountId ?? "system"}
+          options={rows.map((r) => ({
+            value: r.id ?? "system",
+            label: `${r.label}${r.status === "authenticating" ? " · 로그인 중" : ""}`,
+          }))}
+          onValueChange={(v) => setAccountId(v === "system" ? null : v)}
+          disabled={busy}
+        />
+      </View>
+      <View style={card}>
+        <View
+          style={{
+            flexDirection: "row",
+            flexWrap: "wrap",
+            justifyContent: "space-between",
+            alignItems: "center",
+            gap: 12,
+          }}
+        >
+          <View style={{ flexDirection: "row", gap: 20 }}>
+            {[false, true].map((v) => (
+              <Pressable
+                key={String(v)}
+                accessibilityRole="tab"
+                accessibilityState={{ selected: common === v }}
+                aria-selected={common === v}
+                onPress={() => setCommon(v)}
+                style={{
+                  minHeight: 44,
+                  justifyContent: "center",
+                  borderBottomWidth: 2,
+                  borderBottomColor: common === v ? c.accent : "transparent",
                 }}
               >
-                관리
-              </Button>
-            )}
+                <Text
+                  style={{
+                    color: common === v ? c.foreground : c.foregroundMuted,
+                    fontSize: 16,
+                    fontWeight: "600",
+                  }}
+                >
+                  {v ? "공통 구성" : "설치된 항목"}
+                </Text>
+              </Pressable>
+            ))}
           </View>
-        ))}
-      </View>
-      {query.data?.warnings.map((w) => (
-        <Text key={w} style={body}>
-          {w}
-        </Text>
-      ))}
-      {!!relevant.length && (
-        <View style={{ gap: 14 }}>
-          <Text
-            accessibilityRole="header"
-            style={{ color: c.foreground, fontSize: 16, fontWeight: "600" }}
+          <Button
+            colors={c}
+            icon={common ? "CopyPlus" : "Plus"}
+            disabled={busy || (common && !query.data?.common.length)}
+            onPress={() => {
+              op.reset();
+              setPlan(null);
+              if (common) {
+                setTargets([accountId ?? "system"]);
+                setReplacements([]);
+                setDialog("apply");
+              } else {
+                setName("");
+                setValue("");
+                setKind(
+                  harness === "codex" && scope !== "user" ? "skill" : "plugin",
+                );
+                setDialog("add");
+              }
+            }}
           >
-            최근 변경
+            {common ? "계정에 적용" : "추가"}
+          </Button>
+        </View>
+        {common && (
+          <Text style={body}>
+            이 계정의 실제 설치 상태를 함께 표시합니다. 공통 구성 저장 후 다른
+            계정에는 ‘계정에 적용’을 눌러 설치하세요.
           </Text>
-          {relevant.map((j) => (
-            <View
-              key={j.id}
+        )}
+        {!common && missingCommon.length > 0 && (
+          <View style={{ gap: 10 }}>
+            <Text style={body}>
+              이 계정에 아직 설치하지 않은 공통 항목이 {missingCommon.length}개
+              있습니다.
+            </Text>
+            <View style={{ alignItems: "flex-start" }}>
+              <Button colors={c} disabled={busy} onPress={startApply}>
+                빠진 공통 항목 설치
+              </Button>
+            </View>
+          </View>
+        )}
+        {!common && (
+          <View
+            style={{
+              flexDirection: "row",
+              flexWrap: "wrap",
+              gap: 8,
+              alignItems: "center",
+            }}
+          >
+            <TextInput
+              accessibilityLabel="설치 항목 검색"
+              placeholder="항목 검색"
+              placeholderTextColor={c.foregroundMuted}
+              value={search}
+              onChangeText={setSearch}
               style={{
-                gap: 10,
-                paddingBottom: 12,
+                flexGrow: 1,
+                flexBasis: 200,
+                color: c.foreground,
+                backgroundColor: c.surface1,
+                borderColor: c.border,
+                borderWidth: 1,
+                borderRadius: 8,
+                padding: 12,
+                fontSize: 16,
+              }}
+            />
+            <View style={{ width: "100%" }}>
+              <SettingsSelect
+                label="종류"
+                value={filter}
+                options={[
+                  { value: "all", label: "전체" },
+                  ...Object.entries(kinds).map(([value, label]) => ({
+                    value,
+                    label,
+                  })),
+                ]}
+                onValueChange={setFilter}
+              />
+            </View>
+          </View>
+        )}
+        {query.isFetching && (
+          <ActivityIndicator
+            accessibilityLabel="설치 목록 조회 중"
+            color={c.accent}
+          />
+        )}
+        {(query.error || op.error) && (
+          <Text
+            accessibilityRole="alert"
+            style={{ ...body, color: c.statusDanger }}
+          >
+            {message((op.error ?? query.error)!)}
+          </Text>
+        )}
+        {!!notice && (
+          <Text accessibilityLiveRegion="polite" style={body}>
+            {notice}
+          </Text>
+        )}
+        {!!selected.length && (
+          <View
+            style={{
+              flexDirection: "row",
+              flexWrap: "wrap",
+              gap: 10,
+              alignItems: "center",
+            }}
+          >
+            <Text style={body}>{selected.length}개 선택</Text>
+            <Button
+              colors={c}
+              disabled={busy}
+              onPress={() =>
+                op.mutate(async () => {
+                  await save({ target, keys: selected, remove: common });
+                  setSelected([]);
+                  setNotice(
+                    common
+                      ? "공통 구성에서 제외했습니다. 설치된 항목은 유지됩니다."
+                      : "공통 구성을 저장했습니다. 다른 계정에는 ‘계정에 적용’을 눌러 설치하세요.",
+                  );
+                })
+              }
+            >
+              {common ? "공통 구성에서 제외" : "공통 구성으로 저장"}
+            </Button>
+            <Button colors={c} onPress={() => setSelected([])}>
+              선택 해제
+            </Button>
+          </View>
+        )}
+        <View style={{ borderTopWidth: 1, borderColor: c.border }}>
+          {items.length === 0 && !query.isFetching && (
+            <View style={{ paddingVertical: 32, gap: 8 }}>
+              <Text
+                style={{ color: c.foreground, fontSize: 17, fontWeight: "600" }}
+              >
+                {common
+                  ? "아직 공통 구성이 없습니다"
+                  : "표시할 항목이 없습니다"}
+              </Text>
+              <Text style={body}>
+                {common
+                  ? "설치된 항목에서 함께 사용할 항목을 선택해 저장하세요."
+                  : "다른 계정을 선택하거나 필요한 항목을 추가하세요."}
+              </Text>
+            </View>
+          )}
+          {items.map((r, i) => (
+            <View
+              key={`${r.key}:${r.scope}:${i}`}
+              style={{
+                flexDirection: "row",
+                alignItems: "center",
+                gap: 12,
+                paddingVertical: 12,
                 borderBottomWidth: 1,
                 borderColor: c.border,
               }}
             >
-              <View
-                style={{
-                  flexDirection: "row",
-                  flexWrap: "wrap",
-                  alignItems: "center",
-                  justifyContent: "space-between",
-                  gap: 8,
-                }}
-              >
+              <Check
+                showLabel={false}
+                label={`${r.name} 선택`}
+                checked={selected.includes(r.key)}
+                colors={c}
+                onPress={() => setSelected(toggle(selected, r.key))}
+              />
+              <View style={{ flex: 1, minWidth: 0, gap: 5 }}>
                 <Text
-                  accessibilityLiveRegion="polite"
+                  selectable
                   style={{
-                    ...body,
-                    color: j.status === "error" ? c.statusDanger : c.foreground,
+                    color: c.foreground,
+                    fontSize: 16,
+                    fontWeight: "500",
                   }}
                 >
-                  {statuses[j.status]} ·{" "}
-                  {j.steps.filter((s) => s.status === "done").length}/
-                  {j.steps.filter((s) => s.action !== "skip").length}개
+                  {r.name}
                 </Text>
-                <View
-                  style={{ flexDirection: "row", flexWrap: "wrap", gap: 8 }}
-                >
-                  {["waiting", "approval", "error"].includes(j.status) && (
-                    <Button
-                      colors={c}
-                      disabled={busy}
-                      onPress={() => op.mutate(() => jobsRpc({ cancel: j.id }))}
-                    >
-                      취소
-                    </Button>
-                  )}
-                  {j.status === "error" && (
-                    <Button
-                      colors={c}
-                      disabled={busy}
-                      onPress={() => op.mutate(() => jobsRpc({ retry: j.id }))}
-                    >
-                      재시도
-                    </Button>
-                  )}
-                </View>
+                <Text style={{ ...body, fontSize: 13 }}>
+                  {[
+                    kinds[r.kind],
+                    r.version,
+                    r.common && !common ? "공통 구성" : null,
+                    common
+                      ? r.installation === "missing"
+                        ? "이 계정에 미설치"
+                        : r.installation === "different"
+                          ? "설치됨 · 공통 구성과 다름"
+                          : r.installation === "installed"
+                            ? "이 계정에 설치됨"
+                            : "설치 상태 확인 중"
+                      : null,
+                    !r.enabled ? "비활성" : null,
+                    r.scope === "host"
+                      ? "호스트 공통"
+                      : r.scope === "builtin"
+                        ? "기본 제공"
+                        : r.scope === "managed"
+                          ? "조직 관리"
+                          : r.scope !== scope
+                            ? r.scope === "user"
+                              ? "계정 범위"
+                              : "프로젝트 범위"
+                            : null,
+                    r.authNeeded ? "인증 값 확인 필요" : null,
+                  ]
+                    .filter(Boolean)
+                    .join(" · ")}
+                </Text>
               </View>
-              {j.steps
-                .filter((s) => s.status !== "skipped")
-                .map((s, index) => (
-                  <View key={index} style={{ gap: 6 }}>
-                    <Text style={body}>
-                      {label(s.target.accountId)} · {s.name} ·{" "}
-                      {actions[s.action]}
-                      {s.status !== "done" ? ` · ${statuses[s.status]}` : ""}
-                    </Text>
-                    {s.message && (
-                      <Text
-                        style={{
-                          ...body,
-                          color:
-                            s.status === "error"
-                              ? c.statusDanger
-                              : c.foregroundMuted,
-                        }}
-                      >
-                        {s.message}
-                      </Text>
-                    )}
-                    {s.status === "approval" && s.command && (
-                      <>
-                        <Text style={body}>
-                          설치 소스가 다음 명령을 실행하려고 합니다. 내용을
-                          확인한 후 승인하세요.
-                        </Text>
-                        <Text
-                          selectable
-                          style={{
-                            ...body,
-                            fontFamily: "monospace",
-                            backgroundColor: c.surface1,
-                            padding: 12,
-                            borderRadius: 8,
-                          }}
-                        >
-                          {s.command}
-                        </Text>
-                        <Button
-                          colors={c}
-                          disabled={busy}
-                          onPress={() =>
-                            op.mutate(() =>
-                              jobsRpc({
-                                approve: { id: j.id, hash: s.approvalHash! },
-                              }),
-                            )
-                          }
-                        >
-                          이 명령 실행 승인
-                        </Button>
-                      </>
-                    )}
-                    {["done", "error"].includes(s.status) &&
-                      s.backupId &&
-                      s.action !== "restore" && (
-                        <View style={{ alignItems: "flex-start" }}>
-                          <Button
-                            colors={c}
-                            disabled={busy}
-                            onPress={() =>
-                              op.mutate(() =>
-                                jobsRpc({
-                                  restore: {
-                                    id: j.id,
-                                    index: j.steps.indexOf(s),
-                                    confirmed: true,
-                                  },
-                                }),
-                              )
-                            }
-                          >
-                            이전 구성으로 복원
-                          </Button>
-                        </View>
-                      )}
-                  </View>
-                ))}
+              {!common && (
+                <Button
+                  colors={c}
+                  icon="ChevronRight"
+                  onPress={() => {
+                    op.reset();
+                    setItem(r);
+                    setValue("");
+                    setEditing(false);
+                    setRemove(false);
+                    setDialog("detail");
+                  }}
+                >
+                  관리
+                </Button>
+              )}
             </View>
           ))}
         </View>
-      )}
-      <View style={{ gap: 14 }}>
+        {query.data?.warnings.map((w) => (
+          <Text key={w} style={body}>
+            {w}
+          </Text>
+        ))}
+      </View>
+      <View style={card}>
+        <Text
+          accessibilityRole="header"
+          style={{ color: c.foreground, fontSize: 17, fontWeight: "600" }}
+        >
+          설정
+        </Text>
         <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 8 }}>
           <Button colors={c} onPress={() => setAdvanced(!advanced)}>
             관리 범위{advanced ? " 접기" : ""}
@@ -822,6 +743,211 @@ export function ExtensionsPanel({
           새로고침
         </Button>
       </View>
+      <Modal
+        title="최근 변경"
+        open={dialog === "history"}
+        onOpenChange={(open) => {
+          if (!open && !busy) setDialog(null);
+        }}
+      >
+        <Modal.Content
+          scrollable={false}
+          contentContainerStyle={{ padding: layout.compact ? 16 : 20, gap: 16 }}
+        >
+          <Text style={body}>
+            {harnessLabels[harness]}의 최근 변경입니다. 각 작업에서 적용 상태와
+            복원 가능 여부를 확인할 수 있습니다.
+          </Text>
+          {jobs.isFetching && !jobs.data && (
+            <ActivityIndicator
+              accessibilityLabel="변경 이력 조회 중"
+              color={c.accent}
+            />
+          )}
+          {(jobs.error || op.error) && (
+            <Text
+              accessibilityRole="alert"
+              style={{ ...body, color: c.statusDanger }}
+            >
+              {message((op.error ?? jobs.error)!)}
+            </Text>
+          )}
+          <SheetScrollView
+            style={{ maxHeight: layout.compact ? 360 : 460 }}
+            contentContainerStyle={{ gap: 14 }}
+          >
+            {relevant.length === 0 && !jobs.isFetching && (
+              <Text style={{ ...body, paddingVertical: 24 }}>
+                아직 변경 이력이 없습니다.
+              </Text>
+            )}
+            {relevant.map((j) => (
+              <View key={j.id} style={card}>
+                <View style={{ gap: 5 }}>
+                  <Text
+                    style={{
+                      color: c.foreground,
+                      fontSize: 16,
+                      fontWeight: "600",
+                    }}
+                  >
+                    {j.steps.length > 1
+                      ? "공통 구성 적용"
+                      : `${j.steps[0]?.name ?? "확장"} · ${actions[j.steps[0]?.action ?? "configure"]}`}
+                  </Text>
+                  <Text style={{ ...body, fontSize: 12 }}>
+                    {new Intl.DateTimeFormat("ko-KR", {
+                      month: "short",
+                      day: "numeric",
+                      hour: "numeric",
+                      minute: "2-digit",
+                    }).format(new Date(j.createdAt))}
+                  </Text>
+                </View>
+                <View
+                  style={{
+                    flexDirection: "row",
+                    flexWrap: "wrap",
+                    alignItems: "center",
+                    justifyContent: "space-between",
+                    gap: 8,
+                  }}
+                >
+                  <Text
+                    accessibilityLiveRegion="polite"
+                    style={{
+                      ...body,
+                      color:
+                        j.status === "error" ? c.statusDanger : c.foreground,
+                    }}
+                  >
+                    {statuses[j.status]}
+                    {j.steps.filter((s) => s.action !== "skip").length > 1
+                      ? ` · ${j.steps.filter((s) => s.status === "done").length}/${j.steps.filter((s) => s.action !== "skip").length}개`
+                      : ""}
+                  </Text>
+                  <View
+                    style={{ flexDirection: "row", flexWrap: "wrap", gap: 8 }}
+                  >
+                    {["waiting", "approval", "error"].includes(j.status) && (
+                      <Button
+                        colors={c}
+                        disabled={busy}
+                        onPress={() =>
+                          op.mutate(() => jobsRpc({ cancel: j.id }))
+                        }
+                      >
+                        취소
+                      </Button>
+                    )}
+                    {j.status === "error" && (
+                      <Button
+                        colors={c}
+                        disabled={busy}
+                        onPress={() =>
+                          op.mutate(() => jobsRpc({ retry: j.id }))
+                        }
+                      >
+                        재시도
+                      </Button>
+                    )}
+                  </View>
+                </View>
+                {j.steps
+                  .filter((s) => s.status !== "skipped")
+                  .map((s, index) => (
+                    <View
+                      key={index}
+                      style={{
+                        gap: 8,
+                        paddingTop: 12,
+                        borderTopWidth: 1,
+                        borderColor: c.border,
+                      }}
+                    >
+                      <Text style={body}>
+                        {label(s.target.accountId)}
+                        {j.steps.length > 1
+                          ? ` · ${s.name} · ${actions[s.action]}`
+                          : ""}
+                        {s.status !== "done" ? ` · ${statuses[s.status]}` : ""}
+                      </Text>
+                      {s.message && (
+                        <Text
+                          style={{
+                            ...body,
+                            color:
+                              s.status === "error"
+                                ? c.statusDanger
+                                : c.foregroundMuted,
+                          }}
+                        >
+                          {s.message}
+                        </Text>
+                      )}
+                      {s.status === "approval" && s.command && (
+                        <>
+                          <Text style={body}>
+                            설치 소스가 다음 명령을 실행하려고 합니다. 내용을
+                            확인한 후 승인하세요.
+                          </Text>
+                          <Text
+                            selectable
+                            style={{
+                              ...body,
+                              fontFamily: "monospace",
+                              backgroundColor: c.surface1,
+                              padding: 12,
+                              borderRadius: 8,
+                            }}
+                          >
+                            {s.command}
+                          </Text>
+                          <Button
+                            colors={c}
+                            disabled={busy}
+                            onPress={() =>
+                              op.mutate(() =>
+                                jobsRpc({
+                                  approve: { id: j.id, hash: s.approvalHash! },
+                                }),
+                              )
+                            }
+                          >
+                            이 명령 실행 승인
+                          </Button>
+                        </>
+                      )}
+                      {["done", "error"].includes(s.status) &&
+                        s.backupId &&
+                        s.action !== "restore" && (
+                          <View style={{ alignItems: "flex-start" }}>
+                            <Button
+                              colors={c}
+                              disabled={busy}
+                              onPress={() =>
+                                op.mutate(() =>
+                                  jobsRpc({
+                                    restore: {
+                                      id: j.id,
+                                      index: j.steps.indexOf(s),
+                                      confirmed: true,
+                                    },
+                                  }),
+                                )
+                              }
+                            >
+                              이전 구성으로 복원
+                            </Button>
+                          </View>
+                        )}
+                    </View>
+                  ))}
+              </View>
+            ))}
+          </SheetScrollView>
+        </Modal.Content>
+      </Modal>
       <Modal
         title="확장 추가"
         open={dialog === "add"}
