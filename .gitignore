@@ -9,3 +9,6 @@ metadata.json
 harness-accounts/
 .codex/
 .claude/
+
+.extensions-native-*/
+paseo-extensions-*/

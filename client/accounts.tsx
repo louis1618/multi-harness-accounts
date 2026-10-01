@@ -8,7 +8,8 @@ import { changeAccount, harnessLabels, formatResetCountdown, listAccounts, listS
   type Action, type Harness, type Metrics, type Snapshot } from "../shared/accounts.js";
 import { serviceLogos } from "./branding.js";
 
-type Colors = PluginSurfaceProps["theme"]["colors"];
+import { Button, type Colors } from "./ui.js";
+import { ExtensionsPanel } from "./extensions.js";
 type Row = { id: string | null; harness: Harness; label: string; email: string | null; status: string; error: string | null; authUrl: string | null; metrics: Metrics };
 const number = (value: number) => new Intl.NumberFormat("ko-KR").format(value);
 const compact = (value: number) => new Intl.NumberFormat("ko-KR", { notation: "compact", maximumFractionDigits: 1 }).format(value);
@@ -18,19 +19,6 @@ const errorMessage = (error: Error | null) => {
   return start >= 0 ? message.slice(start).split(" requestType=")[0] : "작업을 완료하지 못했습니다. 로그인과 연결 상태를 확인하고 다시 시도하세요.";
 };
 const statusLabel: Record<string, string> = { idle: "대기 중", running: "실행 중", initializing: "준비 중", closed: "닫힌 세션", error: "확인 필요" };
-function Button({ children, onPress, colors, disabled = false, icon, primary = false, danger = false }: {
-  children: ReactNode; onPress: () => void; colors: Colors; disabled?: boolean; icon?: string; primary?: boolean; danger?: boolean;
-}) {
-  const color = primary ? colors.accentForeground : danger ? colors.statusDanger : colors.foreground;
-  return <Pressable accessibilityRole="button" accessibilityState={{ disabled }} disabled={disabled} onPress={onPress}
-    style={({ pressed }) => ({ minHeight: 44, paddingHorizontal: 14, paddingVertical: 10, borderRadius: 8,
-      flexDirection: "row", alignItems: "center", justifyContent: "center", gap: 7,
-      backgroundColor: primary ? colors.accent : pressed ? colors.surface2 : colors.surface1,
-      borderWidth: primary ? 0 : 1, borderColor: colors.border, opacity: disabled ? 0.45 : pressed ? 0.8 : 1 })}>
-    {icon && <Icon name={icon} size={16} color={color} />}
-    <Text style={{ color, fontSize: 14, fontWeight: "500" }}>{children}</Text>
-  </Pressable>;
-}
 function Badge({ children, colors, active = false }: { children: ReactNode; colors: Colors; active?: boolean }) {
   return <Text style={{ color: active ? colors.accent : colors.foregroundMuted, backgroundColor: colors.surface2,
     fontSize: 12, fontWeight: "600", paddingHorizontal: 8, paddingVertical: 4, borderRadius: 5 }}>{children}</Text>;
@@ -150,11 +138,11 @@ function Dashboard({ data, rows, colors }: { data: Snapshot; rows: Row[]; colors
 }
 
 export function AgentAccountsPanel(props: PluginAgentPanelProps) { return <AccountsSurface {...props} initialAgentId={props.agentId} />; }
-export function AccountsSurface({ theme, layout, initialAgentId }: PluginSurfaceProps & { initialAgentId?: string }) {
+export function AccountsSurface({ theme, layout, host, initialAgentId }: PluginSurfaceProps & { initialAgentId?: string }) {
   const colors = theme.colors, list = useRpc(listAccounts), change = useRpc(changeAccount);
   const fetchSessions = useRpc(listSessions), importSession = useRpc(importAccountSession);
   const prepare = useRpc(prepareReset), consume = useRpc(consumeReset), queryClient = useQueryClient();
-  const [tab, setTab] = useState<"usage" | "accounts">(initialAgentId ? "accounts" : "usage");
+  const [tab, setTab] = useState<"usage" | "accounts" | "extensions">(initialAgentId ? "accounts" : "usage");
   const [agentId, setAgentId] = useState(initialAgentId ?? "");
   const [adding, setAdding] = useState<Harness | null>(null), [label, setLabel] = useState("");
   const [confirmation, setConfirmation] = useState<{ kind: "relogin" | "remove" | "logout"; row: Row } | null>(null);
@@ -163,12 +151,12 @@ export function AccountsSurface({ theme, layout, initialAgentId }: PluginSurface
   const [notice, setNotice] = useState("");
   const [now, setNow] = useState(Date.now);
   useEffect(() => { const timer = setInterval(() => setNow(Date.now()), 30000); return () => clearInterval(timer); }, []);
-  const query = useQuery({ queryKey: ["accounts"], queryFn: () => list({}),
+  const query = useQuery({ queryKey: ["accounts", host.id], queryFn: () => list({}),
     refetchInterval: query => [...(query.state.data?.accounts ?? []), ...(query.state.data?.systemAccounts ?? [])]
       .some(row => row.status === "authenticating" || row.metrics.quota.status === "loading") || query.state.data?.agents.some(agent => agent.pending || agent.rotation && ["checking", "switching", "sending"].includes(agent.rotation.phase)) ? 3000 : 30000 });
   const mutation = useMutation({ mutationFn: (input: Action) => change(input), onMutate: () => setNotice(""),
     onSettled: () => queryClient.invalidateQueries({ queryKey: ["accounts"] }) });
-  const sessionsQuery = useQuery({ queryKey: ["account-sessions"], enabled: picking, queryFn: () => fetchSessions({ refresh: true }), staleTime: 0 });
+  const sessionsQuery = useQuery({ queryKey: ["account-sessions", host.id], enabled: picking, queryFn: () => fetchSessions({ refresh: true }), staleTime: 0 });
   const importMutation = useMutation({ mutationFn: (id: string) => importSession({ id }),
     onSuccess: result => { setAgentId(result.agentId); setPicking(false); },
     onSettled: () => { void queryClient.invalidateQueries({ queryKey: ["accounts"] }); void queryClient.invalidateQueries({ queryKey: ["account-sessions"] }); } });
@@ -214,11 +202,11 @@ export function AccountsSurface({ theme, layout, initialAgentId }: PluginSurface
     <ScrollView style={{ flex: 1, backgroundColor: colors.surface0 }} contentContainerStyle={{
       padding: layout.compact ? 16 : 28, gap: 28, width: "100%", maxWidth: 1100, alignSelf: "center" }}>
       <View accessibilityRole="tablist" style={{ flexDirection: "row", gap: 24, borderBottomWidth: 1, borderColor: colors.border }}>
-        {(["usage", "accounts"] as const).map(value => <Pressable key={value} accessibilityRole="tab" accessibilityState={{ selected: tab === value }} aria-selected={tab === value}
+        {(["usage", "accounts", "extensions"] as const).map(value => <Pressable key={value} accessibilityRole="tab" accessibilityState={{ selected: tab === value }} aria-selected={tab === value}
           onPress={() => setTab(value)} style={{ flexDirection: "row", alignItems: "center", gap: 8, paddingVertical: 14,
             borderBottomWidth: 2, borderBottomColor: tab === value ? colors.accent : "transparent" }}>
-          <Icon name={value === "usage" ? "ChartNoAxesCombined" : "Users"} size={18} color={tab === value ? colors.foreground : colors.foregroundMuted} />
-          <Text style={{ color: tab === value ? colors.foreground : colors.foregroundMuted, fontSize: 16, fontWeight: "600" }}>{value === "usage" ? "사용량" : "계정"}</Text>
+          <Icon name={value === "usage" ? "ChartNoAxesCombined" : value === "accounts" ? "Users" : "Blocks"} size={18} color={tab === value ? colors.foreground : colors.foregroundMuted} />
+          <Text style={{ color: tab === value ? colors.foreground : colors.foregroundMuted, fontSize: 16, fontWeight: "600" }}>{value === "usage" ? "사용량" : value === "accounts" ? "계정" : "확장 관리"}</Text>
         </Pressable>)}
       </View>
       {(query.isLoading || busy) && <ActivityIndicator accessibilityLabel="계정 정보 처리 중" color={colors.accent} />}
@@ -295,13 +283,14 @@ export function AccountsSurface({ theme, layout, initialAgentId }: PluginSurface
           </View>}
         </View>
       </>}
-      <View style={{ paddingTop: 22, marginTop: 4, borderTopWidth: 1, borderColor: colors.border,
+      {data && tab === "extensions" && <ExtensionsPanel theme={theme} layout={layout} host={host} accounts={data} />}
+      {tab !== "extensions" && <View style={{ paddingTop: 22, marginTop: 4, borderTopWidth: 1, borderColor: colors.border,
         flexDirection: "row", flexWrap: "wrap", alignItems: "center", justifyContent: "space-between", gap: 12 }}>
         <Text style={{ ...detail, fontSize: 13 }}>한도는 5분간 캐시됩니다. 화면은 자동으로 갱신됩니다.</Text>
         <Button colors={colors} icon="RefreshCw" disabled={busy || query.isFetching} onPress={() => {
           setNotice(""); mutation.mutate({ action: "refresh-usage" });
         }}>새로고침</Button>
-      </View>
+      </View>}
     </ScrollView>
     <Modal title={adding ? `${harnessLabels[adding]} 계정 추가` : "계정 추가"} open={adding !== null} onOpenChange={open => { if (!open && !busy) setAdding(null); }}>
       <Modal.Content>

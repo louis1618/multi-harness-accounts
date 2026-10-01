@@ -38,7 +38,7 @@ function stopRotation(state: State, id: string, message: string) {
   }
 }
 type AgentSummary = Awaited<ReturnType<PaseoApi["agents"]["list"]>>["entries"][number]["agent"];
-async function agentsOn(paseo: PaseoApi, archived = false): Promise<AgentSummary[]> {
+export async function agentsOn(paseo: PaseoApi, archived = false): Promise<AgentSummary[]> {
   const result: AgentSummary[] = [];
   let cursor: string | undefined;
   do {
@@ -855,6 +855,17 @@ export class AccountManager {
       const next = (await this.store.read()).rotations[id];
       if (!this.disposed && next?.phase === "checking") void this.driveRotation(id, paseo);
     }
+  }
+  isAuthenticating(harness: Harness, accountId: string | null) { return this.jobs.has(accountId ?? this.row(harness, null)); }
+  async extensionsChanged(harness: Harness, accountId: string | null, paseo: PaseoApi) {
+    if (!paseo) return;
+    const agents = await agentsOn(paseo);
+    const ids = await this.store.update(state => {
+      const ids = agents.filter(a => a.provider === harness && (state.bindings[a.id] ? state.bindings[a.id].accountId : selectedAccount(state, harness, a.id)) === accountId && a.status !== "closed").map(a => a.id);
+      for (const id of ids) state.pending[id] = { ...state.pending[id], error: null };
+      return ids;
+    });
+    for (const id of ids) await this.applyPending(id, paseo);
   }
   dispose() {
     this.disposed = true;

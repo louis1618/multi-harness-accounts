@@ -28,17 +28,18 @@ Settings → Plugins의 Enable plugins가 켜져 있어야 합니다. 꺼져 있
 개발·검증:
 
 ```sh
-npm ci
+npm ci --legacy-peer-deps
 npm run typecheck
 npm test
 npm run test:native
+npm run test:extensions-native
 ```
 
-`npm ci`는 개발용 타입 검사·테스트에 필요합니다. 실행 코드의 Paseo API 타입은 호스트가 제공하는 `PluginHandlerContext["paseo"]`에서 가져옵니다. 개발용 `node_modules`가 없는 배포 폴더에서 실제 플러그인 빌드와 `accounts.list` RPC의 정상 동작도 확인했습니다.
+설치 준비 명령은 고정된 `smol-toml` 런타임 의존성만 설치합니다. `npm ci --legacy-peer-deps`는 개발용 타입 검사·테스트에 필요합니다. 실행 코드의 Paseo API 타입은 호스트가 제공하는 `PluginHandlerContext["paseo"]`에서 가져옵니다. 개발용 `node_modules`가 없는 배포 폴더에서 실제 플러그인 빌드와 `accounts.list` RPC의 정상 동작도 확인했습니다.
 
 ## 사용
 
-상단 **사용량 / 계정** 탭으로 나눕니다. 사용량 탭에는 누적 토큰·턴·캐시 입력, 토큰 구성, 계정별 사용량과 최근 사용을 표시합니다. 계정 탭에는 서비스 로고와 개별 계정 카드, 기본 계정과 한도를 표시합니다. 화면 전체 새로고침은 최하단에 있습니다.
+상단 **사용량 / 계정 / 확장 관리** 탭으로 나눕니다. 사용량 탭에는 누적 토큰·턴·캐시 입력, 토큰 구성, 계정별 사용량과 최근 사용을 표시합니다. 계정 탭에는 서비스 로고와 개별 계정 카드, 기본 계정과 한도를 표시합니다. 화면 전체 새로고침은 최하단에 있습니다.
 
 - **기존 로그인 표시**: Paseo 밖에서 로그인한 Codex·Claude Code 계정도 자동 조회해 시스템 계정으로 표시합니다. 기본값이 시스템 로그인이면 이 계정에 기본 계정이 표시됩니다. 기존 계정은 원래 네이티브 인증 저장소를 사용합니다.
 - **계정 추가**: 라벨을 입력하면 해당 프로필에서 `codex login` 또는 `claude auth login --claudeai`를 실행합니다. daemon 호스트의 **기본 웹 브라우저(Firefox, Chrome 등)**에서 인증을 완료합니다.
@@ -53,6 +54,23 @@ npm run test:native
 
 같은 하네스의 브라우저 로그인은 하나씩 진행합니다(Codex의 로컬 OAuth 콜백 포트 충돌 방지). 로그인 대기는 10분 뒤 취소됩니다. 브라우저가 없는 원격 daemon은 이 브라우저 로그인 흐름의 검증 범위에 포함되지 않습니다.
 
+## 확장 관리
+
+1. **Codex / Claude Code**와 **관리할 계정**을 선택합니다. 시스템 계정도 관리할 수 있습니다.
+2. **설치된 항목**에서 플러그인·스킬·마켓플레이스·MCP 연결을 확인합니다. 검색과 종류 필터, 관리 버튼으로 편집·활성화·업데이트·삭제·MCP 인증을 제공합니다.
+3. 함께 사용할 항목을 체크하고 **공통 구성으로 저장**합니다. 서비스별 공통 구성은 서로 독립적입니다.
+4. **공통 구성 → 계정에 적용**에서 대상 계정과 변경 내용을 확인합니다. 없는 항목을 추가하며 기존 구성과 다르면 기본적으로 유지합니다. 교체할 항목만 명시적으로 선택합니다. 계정 전용 추가 항목은 삭제하지 않습니다.
+
+플러그인·마켓플레이스 변경은 해당 프로필의 네이티브 CLI를 사용합니다. 플러그인에 포함된 스킬·명령·에이전트·MCP 이름은 관리 화면에서 확인합니다. 설치·업데이트 버전은 마켓플레이스가 제공하는 버전이며 임의 버전 고정을 지원한다고 표시하지 않습니다. 외부 캐시·조직/호스트에서 관리하는 항목은 읽기 전용입니다. Codex의 `~/.agents/skills`는 계정과 무관한 **호스트 공통**입니다.
+
+**관리 범위**에서 기존 프로젝트 세션을 선택할 수 있습니다. Claude는 user/project/local 플러그인과 MCP 범위를 구분하며 local MCP는 해당 프로필의 `.claude.json.projects[프로젝트 경로].mcpServers`에 저장합니다. 프로젝트 구성은 그 폴더를 사용하는 다른 계정에도 적용됩니다. 마켓플레이스 캐시 업데이트/삭제는 계정 범위에서 수행합니다. 현재 Codex CLI의 프로젝트 범위에서는 독립 스킬만 변경하고 플러그인·마켓플레이스·MCP는 계정 범위에서 관리합니다.
+
+**자동 적용 설정**은 기본적으로 꺼져 있습니다. 새 계정 또는 계정 전환 시 저장한 공통 구성에서 없는 항목만 추가할 수 있습니다. 충돌 항목은 자동 교체하지 않습니다. 실행 중인 Paseo 턴과 로그인 완료를 기다린 뒤 변경하며, 대기 중 구성이 바뀌면 적용을 멈춥니다. 변경 후 필요한 provider 세션을 같은 대화 기록으로 다시 열며 메인 daemon은 재시작하지 않습니다. 별도로 실행한 외부 CLI 프로세스는 Paseo가 제어하지 못하므로 그 CLI를 다시 열어 반영합니다.
+
+MCP 환경 변수·헤더·토큰은 공통 구성과 조회 RPC에서 숨기며, 대상 계정의 기존 인증 값은 보존합니다. 인증 값이 없는 대상에는 **인증 값 확인 필요**를 표시합니다. MCP OAuth는 선택한 프로필의 네이티브 `mcp login`과 호스트 기본 브라우저로 진행합니다. 전체 credential/config 디렉터리나 OAuth 인증 파일을 다른 계정으로 복사하지 않습니다. 스킬은 최대 500개 파일·20MB, 인증 파일·외부 파일 링크·특수 파일을 제외한 안전한 복사만 지원합니다.
+
+변경 전 백업을 남깁니다. 스킬·MCP의 **이전 구성으로 복원**은 해당 항목만 복원하고 다른 구성은 유지하며, 이후 편집이나 인증 값 변경이 있으면 덮어쓰지 않습니다. 네이티브 설치 실패는 최근 변경에서 재시도할 수 있습니다. 설치 소스가 실행 명령 승인을 요구하면 정확한 명령을 보여주고 해당 SHA-256 승인만 전달합니다. 데몬 재시작으로 미완료 작업이 남으면 자동 재실행하지 않고 현재 구성을 다시 확인하도록 표시합니다.
+
 ## 저장 구조와 보안
 
 ```text
@@ -65,6 +83,10 @@ $PASEO_HOME/harness-accounts/
   claude/<UUID>/                   # 각 계정의 CLAUDE_CONFIG_DIR
     .credentials.json ...          # Claude Code가 관리
     projects/ ...
+  extensions/
+    state.json                     # 하네스별 공통 구성·자동 적용·작업 상태
+    skills/<해시>/                 # 공통 스킬의 독립 스냅샷
+    backups/                       # 해당 계정의 변경 전 구성, 0600
   history/<Agent ID>/             # 제거된 프로필의 닫힌 대화 기록만 보관
 ```
 
@@ -140,6 +162,8 @@ Paseo 0.10 SDK의 Agent `refresh()`는 조회용이라 실제 재시작에는 �
 | `server/adapters.ts` | 공통 adapter 인터페이스, Codex/Claude 네이티브 인증·환경·기록 이동 |
 | `server/manager.ts` | 선택 우선순위, 로그인 lifecycle, Agent 전환·통계 귀속과 오류 처리 |
 | `server/usage.ts` | 네이티브 한도·리셋권 RPC, 캐시·오류 처리, 사용 기록 파싱 |
+| `server/extensions.ts`, `shared/extensions.ts`, `client/extensions.tsx` | 확장 목록·공통 구성·네이티브 변경·대기/복원 RPC와 한국어 관리 화면 |
+| `tests/extensions.test.mjs`, `tests/extensions-native-smoke.mjs` | 추가 적용·충돌·비밀 비노출·범위·경로·승인·대기/복원과 실제 네이티브 확장 설치 |
 | `server/sessions.ts` | 제한된 네이티브 세션 메타데이터 조회 |
 | `index.server.ts` | daemon RPC와 lifecycle 등록 |
 | `client/accounts.tsx`, `client/branding.ts`, `index.client.tsx` | 사용량/계정 탭·모달, 서비스 로고, Sidebar/Agent 패널 |
@@ -164,3 +188,9 @@ Claude 리셋권 조회·사용 계약은 OpenCodex의 `src/providers/anthropic-
 ## 1.3.1 기본 브라우저·인증 링크 수정
 
 Linux 백그라운드 데몬에서 GNOME 화면 환경을 복구하고 등록된 기본 웹 브라우저를 직접 실행합니다. 시스템 계정과 추가 계정 모두 인증 링크를 표시하며, 로그인 취소·종료 시 링크를 숨깁니다. 실제 설치된 Codex와 Claude CLI의 인증 링크 수집, Firefox 기본 앱 선택, 기본 브라우저 다시 열기 RPC와 임시 파일 정리를 검증했습니다. 인증 완료나 실제 리셋권 소비는 수행하지 않았습니다.
+
+## 1.4.0 확장 관리 검증
+
+한국어 확장 탭, 공통 구성의 추가 적용·충돌 확인·범위 선택·자동 적용·대기 작업·재시도·백업 복원을 추가했습니다. 자동 테스트 39개, 타입 검사와 실제 Paseo 런타임 번들을 검증했습니다. `test:extensions-native`는 생성한 로컬 마켓플레이스와 임시 독립 홈만 사용해 실제 Codex/Claude 설치·공통 구성 적용·활성화·업데이트·삭제를 검사합니다. 모델 API나 실제 리셋권을 사용하지 않습니다. 격리 Paseo RPC와 웹 화면, 실제 Codex 오프라인 세션의 확장 반영/계정 전환 뒤 동일 세션 ID·기존 응답·신규 사용량 보존을 확인했습니다. 물리 iPad와 인증된 외부 MCP OAuth 완료는 직접 검증하지 않았습니다.
+
+공식 저장·범위 계약: [Claude MCP 범위](https://code.claude.com/docs/en/mcp), [Claude 마켓플레이스](https://code.claude.com/docs/en/plugin-marketplaces), [Codex 플러그인](https://developers.openai.com/plugins/build/plugins).
