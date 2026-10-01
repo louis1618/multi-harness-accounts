@@ -125,6 +125,7 @@ export const ActionSchema = z.discriminatedUnion("action", [
   z.object({ action: z.literal("relogin"), id: AccountIdSchema }).strict(),
   z.object({ action: z.literal("remove"), id: AccountIdSchema }).strict(),
   z.object({ action: z.literal("cancel-login"), id: AccountIdSchema }).strict(),
+  z.object({ action: z.literal("open-login-browser"), harness: HarnessSchema, accountId: AccountIdSchema.nullable() }).strict(),
   z.object({ action: z.literal("select"), harness: HarnessSchema, accountId: AccountIdSchema.nullable(), agentId: AgentIdSchema.optional() }).strict(),
   z.object({ action: z.literal("inherit"), agentId: AgentIdSchema }).strict(),
   z.object({ action: z.literal("retry"), agentId: AgentIdSchema }).strict(),
@@ -139,12 +140,12 @@ export type Action = z.infer<typeof ActionSchema>;
 export const SnapshotSchema = z.object({
   systemAccounts: z.array(z.object({
     harness: HarnessSchema, status: z.enum(["signed-in", "signed-out", "authenticating", "error"]),
-    email: z.string().nullable(), error: z.string().nullable(),
+    email: z.string().nullable(), error: z.string().nullable(), authUrl: z.string().max(16384).nullable().default(null),
     metrics: MetricsSchema,
   }).strict()),
   accounts: z.array(AccountSchema.extend({
     status: z.enum(["signed-in", "signed-out", "authenticating", "error"]),
-    email: z.string().nullable(), error: z.string().nullable(),
+    email: z.string().nullable(), error: z.string().nullable(), authUrl: z.string().max(16384).nullable().default(null),
     metrics: MetricsSchema,
   }).strict()),
   defaults: StateSchema.shape.defaults,

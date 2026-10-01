@@ -1,12 +1,12 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, writeFile, readFile, rm, stat, symlink } from "node:fs/promises";
+import { mkdtemp, mkdir, writeFile, readFile, readdir, rm, stat, symlink } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { setTimeout as delay } from "node:timers/promises";
 import { randomUUID } from "node:crypto";
 import { AccountManager } from "../.test-build/server/manager.js";
-import { createAdapters, transferHistory } from "../.test-build/server/adapters.js";
+import { createAdapters, transferHistory, authorizationUrl, defaultBrowser } from "../.test-build/server/adapters.js";
 import { ActionSchema, SnapshotSchema } from "../.test-build/shared/accounts.js";
 import { Store } from "../.test-build/server/store.js";
 
@@ -20,15 +20,15 @@ async function waitFor(check) {
   for (let i = 0; i < 80; i++) { if (await check()) return; await delay(25); }
   assert.fail("Timed out waiting for native login");
 }
-async function fixture(root) {
+async function fixture(root, loginDelay = 100) {
   const command = join(root, "native-harness");
   const opener = join(root, "default-browser");
   await writeFile(opener, `#!/usr/bin/env node
-import {writeFileSync} from 'node:fs';
+import {writeFileSync,appendFileSync} from 'node:fs';
 import {join} from 'node:path';
 if(process.env.BROWSER) throw Error('browser bridge was inherited');
 if(!process.argv[2].startsWith('https://')) throw Error('invalid browser URL');
-writeFileSync(join(process.cwd(),'browser-opened'),'native-browser-flow');
+if(process.cwd().startsWith(${JSON.stringify(root)}))writeFileSync(join(process.cwd(),'browser-opened'),'native-browser-flow');appendFileSync(join(${JSON.stringify(root)},'browser-count'),'x');
 `, {mode:0o700});
   await writeFile(command, `#!/usr/bin/env node
 import { writeFileSync, readFileSync, existsSync, rmSync } from 'node:fs';
@@ -47,9 +47,9 @@ if (!args.includes('login')) process.exit(2);
 for (const key of ['OPENAI_API_KEY','CODEX_ACCESS_TOKEN','ANTHROPIC_API_KEY','CLAUDE_CODE_OAUTH_TOKEN']) {
   if (process.env[key]) throw Error('credential environment leaked');
 }
-execFileSync(process.env.BROWSER,['https://auth.example.test/oauth/authorize?state=fixture']);
+execFileSync(process.env.BROWSER,['https://auth.openai.com/oauth/authorize?state=fixture']);
 setTimeout(() => writeFileSync(file, JSON.stringify({tokens:{access_token:'${secret}',
-  id_token:'x.'+Buffer.from(JSON.stringify({email:'fixture@example.com'})).toString('base64url')+'.x'}})), 100);
+  id_token:'x.'+Buffer.from(JSON.stringify({email:'fixture@example.com'})).toString('base64url')+'.x'}})), ${loginDelay});
 `, { mode: 0o700 });
   return createAdapters({ codex: command, claude: command }, opener);
 }
@@ -216,4 +216,28 @@ console.log(JSON.stringify({loggedIn:true,email:Object.hasOwn(process.env,'CLAUD
   const adapter=createAdapters({claude:command}).claude;
   const status=await adapter.status(adapter.systemHome,true);
   assert.equal(status.email,Object.hasOwn(process.env,'CLAUDE_CONFIG_DIR')?'env-set@example.test':'env-unset@example.test');
+});
+
+
+test("authorization links are temporary, allowlisted, reopen on the host and never enter metadata", async t => {
+  const root=await temporary(t), adapters=await fixture(root,2000), manager=new AccountManager({root:join(root,'accounts'),adapters});t.after(()=>manager.dispose());
+  const paseo={agents:{async list(){return {entries:[],pageInfo:{hasMore:false,nextCursor:null}};}}};
+  const link='https://auth.openai.com/oauth/authorize?state=fixture';assert.equal(authorizationUrl(link),link);
+  for(const url of ['javascript:alert(1)','https://evil.example/oauth/authorize','https://auth.openai.com/oauth/token?access_token=secret','https://auth.openai.com/oauth/authorize?access_token=secret','https://auth.openai.com/oauth/authorize?code=secret'])assert.equal(authorizationUrl(url),null);
+  assert.ok(authorizationUrl('https://claude.ai/oauth/authorize?code=true&state=fixture'));
+  assert.ok(authorizationUrl('https://claude.com/cai/oauth/authorize?code=true&state=fixture'));
+  assert.equal(authorizationUrl('https://claude.com/cai/oauth/token?access_token=secret'),null);
+  for(const harness of ['codex','claude']) {
+    const before=await readFile(join(root,'browser-count'),'utf8').then(text=>text.length).catch(()=>0);
+    await manager.change({action:'add',harness,label:'Fixture '+harness},paseo);
+    let row;await waitFor(async()=>{row=(await manager.snapshot(paseo)).accounts.find(a=>a.harness===harness);return row?.authUrl===link;});
+    assert.equal(row.status,'authenticating');assert.ok(!JSON.stringify(await manager.store.read()).includes(link));
+    const home=manager.profile(row);const files=(await readdir(home)).filter(name=>name.startsWith('.auth-url-'));assert.equal(files.length,1);assert.equal((await stat(join(home,files[0]))).mode&0o777,0o600);
+    await waitFor(async()=>await readFile(join(root,'browser-count'),'utf8').then(text=>text.length===before+1).catch(()=>false));
+    await manager.change({action:'open-login-browser',harness,accountId:row.id},paseo);assert.equal((await readFile(join(root,'browser-count'),'utf8')).length,before+2);
+    await manager.change({action:'cancel-login',id:row.id},paseo);assert.equal((await manager.snapshot(paseo)).accounts.find(a=>a.id===row.id).authUrl,null);
+    await assert.rejects(manager.change({action:'open-login-browser',harness,accountId:row.id},paseo),/종료/);
+    await waitFor(async()=>!(await readdir(home)).some(name=>name.startsWith('.auth-url-')));
+  }
+  const launcher=await defaultBrowser();if(process.platform==='linux'){assert.ok(launcher.command==='/usr/bin/gio'||launcher.command==='/usr/bin/xdg-open');}
 });

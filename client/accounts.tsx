@@ -9,7 +9,7 @@ import { changeAccount, harnessLabels, formatResetCountdown, listAccounts, listS
 import { serviceLogos } from "./branding.js";
 
 type Colors = PluginSurfaceProps["theme"]["colors"];
-type Row = { id: string | null; harness: Harness; label: string; email: string | null; status: string; error: string | null; metrics: Metrics };
+type Row = { id: string | null; harness: Harness; label: string; email: string | null; status: string; error: string | null; authUrl: string | null; metrics: Metrics };
 const number = (value: number) => new Intl.NumberFormat("ko-KR").format(value);
 const compact = (value: number) => new Intl.NumberFormat("ko-KR", { notation: "compact", maximumFractionDigits: 1 }).format(value);
 const date = (value: string) => new Intl.DateTimeFormat("ko-KR", { year: "numeric", month: "short", day: "numeric", hour: "numeric", minute: "2-digit" }).format(new Date(value));
@@ -264,6 +264,13 @@ export function AccountsSurface({ theme, layout, initialAgentId }: PluginSurface
                   onPress={() => { mutation.reset(); setConfirmation({ kind: row.id ? "remove" : "logout", row }); }}>{row.id ? "삭제" : "로그아웃"}</Button>
               </View>
             </View>
+            {row.status === "authenticating" && <View style={{ gap: 12 }}>
+              <Text style={{ color: colors.foreground, fontSize: 14, fontWeight: "600" }}>인증 링크</Text>
+              {row.authUrl ? <><Text selectable accessibilityLabel="로그인 인증 링크" style={{ ...detail, fontSize: 12 }}>{row.authUrl}</Text>
+                <Text style={{ ...detail, fontSize: 12 }}>호스트의 기본 브라우저에서 인증하세요. 링크를 직접 복사해 Firefox에 붙여넣을 수도 있습니다. 로그인 종료·취소 시 링크를 숨깁니다.</Text>
+                <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 8 }}><Button colors={colors} icon="ExternalLink" disabled={busy} onPress={() => mutation.mutate({ action: "open-login-browser", harness, accountId: row.id })}>기본 브라우저에서 다시 열기</Button></View></> :
+                <Text accessibilityLiveRegion="polite" style={detail}>네이티브 로그인에서 인증 링크를 준비하고 있습니다…</Text>}
+            </View>}
             {row.error && <Text accessibilityRole="alert" style={{ ...detail, color: colors.statusDanger }}>{row.error}</Text>}
             <QuotaDetails row={row} colors={colors} now={now} onReset={() => openReset(row)} />
           </View>)}

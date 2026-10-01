@@ -70,11 +70,15 @@ $PASEO_HOME/harness-accounts/
 
 디렉터리는 `0700`, 플러그인이 쓰는 파일은 `0600`입니다. 메타데이터는 직렬화한 변경과 임시 파일 → rename으로 저장합니다. 손상된 메타데이터는 자동 초기화하지 않습니다. 프로필의 config/credential 파일과 기록 디렉터리에 대한 symlink를 거부합니다.
 
-공유 타입과 RPC는 Zod로 입력·출력을 검증합니다. 클라이언트에는 계정 표시 정보·전환 상태·한도·토큰 합계만 반환합니다. 네이티브 로그인 출력, credential 파일, access/refresh/ID token은 RPC나 로그로 전달하지 않습니다. ID token의 이메일과 계정 식별 claim은 표시·통계 귀속용으로만 읽고 인증 판단에는 사용하지 않습니다. 통계용 계정 식별자는 SHA-256 해시로 보관하며 RPC에 포함하지 않습니다. 네이티브 프로세스는 `shell: false`로 실행합니다.
+공유 타입과 RPC는 Zod로 입력·출력을 검증합니다. 클라이언트에는 계정 표시 정보·전환 상태·한도·토큰 합계와 로그인 진행 중인 계정의 인증 링크만 반환합니다. 네이티브 로그인 출력, credential 파일, access/refresh/ID token은 RPC나 로그로 전달하지 않습니다. ID token의 이메일과 계정 식별 claim은 표시·통계 귀속용으로만 읽고 인증 판단에는 사용하지 않습니다. 통계용 계정 식별자는 SHA-256 해시로 보관하며 RPC에 포함하지 않습니다. 네이티브 프로세스는 `shell: false`로 실행합니다.
 
 계정 프로필 실행에는 환경의 API key/OAuth token/API endpoint override를 빈 값으로 덮어써 다른 인증이 선택되지 않게 합니다. 기존 시스템 계정 조회는 원래 인증 환경을 유지합니다. Codex workload identity가 설정된 환경에서는 프로필 선택을 거부합니다. 프로젝트와 조직의 정책은 하네스가 적용합니다.
 
-로그인할 때는 상속된 앱 브라우저 브릿지를 교체하고 OS 기본 브라우저 실행기로 HTTP/HTTPS 인증 링크를 엽니다(Linux `xdg-open`, macOS `open`). 인증 URL과 로그인 출력은 RPC나 로그로 반환하지 않습니다. 실제 Codex·Claude CLI가 이 실행기를 호출하는 것을 별도 격리 프로필에서 확인했습니다.
+로그인할 때는 상속된 앱 브라우저 브릿지를 교체합니다. Linux에서는 사용자 데스크톱 세션의 화면 환경변수만 보완하고, HTTPS 기본 앱의 등록된 `.desktop` 파일을 `gio launch`로 실행합니다. 등록 정보를 찾지 못한 경우에만 OS `xdg-open`으로 폴백하며 macOS에서는 `open`을 사용합니다. 백그라운드 데몬에 화면 환경이 빠져 다른 브라우저로 폴백하는 문제를 방지합니다.
+
+로그인 중인 계정 카드에는 **인증 링크**와 **기본 브라우저에서 다시 열기** 버튼이 표시됩니다. 버튼은 Paseo 클라이언트의 브라우저 열기 API를 호출하지 않고 데몬 호스트의 기본 브라우저를 사용합니다. 링크는 선택·복사하여 Firefox에 직접 붙여넣을 수도 있습니다. OAuth 로컬 콜백을 사용하는 경우 인증은 데몬 호스트의 브라우저에서 완료해야 합니다.
+
+네이티브 로그인 출력은 서버 내부에서만 검사하고, 알려진 OpenAI·Claude 인증 주소의 `/oauth/authorize` 또는 `/cai/oauth/authorize` 링크만 전달합니다. callback/token 주소와 access/refresh/ID token, client secret이 포함된 값은 차단합니다. 링크는 진행 중인 로그인 상태에만 보관하며 완료·취소·10분 만료 시 화면에서 제거합니다. 일부 CLI가 브라우저 실행기의 출력을 감추므로 `0600` 임시 파일로 링크를 수집하고 프로세스 종료 시 삭제합니다. 링크를 계정 메타데이터나 로그에 저장하지 않습니다. 실제 Codex·Claude CLI의 링크 수집을 별도 격리 프로필에서 확인했고 브라우저 실행기는 테스트용 대역으로 연결하여 기존 계정에 로그인하거나 로그아웃하지 않았습니다.
 
 ## 한도와 사용 통계
 
@@ -156,3 +160,7 @@ OAuth 브라우저에서 실제 사용자 계정으로 로그인 완료, 두 실
 서비스 로고는 설치된 [OpenCodex](https://github.com/lidge-jun/opencodex)의 provider-icons에서 가져온 OpenAI·Claude 마크이며 각 서비스의 상표입니다. Codex 한도·리셋권은 [Codex app-server 공식 계약](https://developers.openai.com/codex/app-server/)을 따릅니다.
 
 Claude 리셋권 조회·사용 계약은 OpenCodex의 `src/providers/anthropic-reset-grants.ts` 구현을 참고했습니다. 실제 계정 검증은 GET 조회만 수행했고 사용 요청은 가짜 응답으로만 검증했습니다.
+
+## 1.3.1 기본 브라우저·인증 링크 수정
+
+Linux 백그라운드 데몬에서 GNOME 화면 환경을 복구하고 등록된 기본 웹 브라우저를 직접 실행합니다. 시스템 계정과 추가 계정 모두 인증 링크를 표시하며, 로그인 취소·종료 시 링크를 숨깁니다. 실제 설치된 Codex와 Claude CLI의 인증 링크 수집, Firefox 기본 앱 선택, 기본 브라우저 다시 열기 RPC와 임시 파일 정리를 검증했습니다. 인증 완료나 실제 리셋권 소비는 수행하지 않았습니다.

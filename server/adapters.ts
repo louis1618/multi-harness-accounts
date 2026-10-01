@@ -1,14 +1,52 @@
 import { spawn, execFile, type ChildProcess } from "node:child_process";
 import { promisify } from "node:util";
-import { readFile, readdir, lstat, chmod } from "node:fs/promises";
+import { readFile, readdir, lstat, chmod, unlink } from "node:fs/promises";
 import { join, relative, resolve } from "node:path";
 import { homedir } from "node:os";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { type Harness, type Quota, type UsageCounter, type ResetOutcome, harnessLabels } from "../shared/accounts.js";
 import { atomicWrite, privateDirectory, AccountError } from "./store.js";
 import { codexQuota, codexConsumeReset, claudeQuota, claudeResetIdentity, claudeConsumeReset, readUsage } from "./usage.js";
 
 const execute = promisify(execFile);
+export function authorizationUrl(value: string): string | null {
+  try {
+    const url = new URL(value);
+    if (url.protocol !== "https:" || url.username || url.password || url.hash || url.port ||
+      !["auth.openai.com/oauth/authorize", "claude.ai/oauth/authorize", "claude.com/cai/oauth/authorize", "console.anthropic.com/oauth/authorize", "platform.claude.com/oauth/authorize"].includes(url.hostname + url.pathname) ||
+      ["access_token", "refresh_token", "id_token", "client_secret", "token", "session_key"].some(key => url.searchParams.has(key)) ||
+      url.searchParams.has("code") && url.searchParams.get("code") !== "true" || value.length > 16384) return null;
+    return url.href;
+  } catch { return null; }
+}
+export async function defaultBrowser(override?: string) {
+  const env = { ...process.env }; delete env.BROWSER;
+  if (process.platform === "linux") {
+    // A background daemon often lacks the graphical session variables; import only the desktop whitelist.
+    try { const { stdout } = await execute("systemctl", ["--user", "show-environment"], { timeout: 3000, maxBuffer: 65536 });
+      for (const line of stdout.split("\n")) { const at = line.indexOf("="), key = line.slice(0, at), value = line.slice(at + 1);
+        if (["DISPLAY", "WAYLAND_DISPLAY", "XAUTHORITY", "XDG_CURRENT_DESKTOP", "XDG_SESSION_TYPE"].includes(key) && value && value.length < 2048 && !/[\0\r\n]/.test(value)) env[key] = value; }
+    } catch { /* The daemon can also run outside a systemd desktop session. */ }
+  }
+  if (override) return { command: override, args: [] as string[], env };
+  if (process.platform === "linux") {
+    try {
+      const { stdout } = await execute("/usr/bin/xdg-mime", ["query", "default", "x-scheme-handler/https"], { env, timeout: 3000, maxBuffer: 4096 });
+      const id = stdout.trim();
+      if (/^[A-Za-z0-9_.-]+\.desktop$/.test(id)) {
+        const roots = [process.env.XDG_DATA_HOME ?? join(homedir(), ".local/share"), ...(process.env.XDG_DATA_DIRS ?? "/usr/local/share:/usr/share:/var/lib/snapd/desktop").split(":")];
+        for (const root of roots) { const file = join(root, "applications", id); try { if ((await lstat(file)).isFile()) return { command: "/usr/bin/gio", args: ["launch", file], env }; } catch { /* Try the next registered desktop location. */ } }
+      }
+    } catch { /* Keep the OS fallback when no desktop application is registered. */ }
+  }
+  return { command: process.platform === "darwin" ? "/usr/bin/open" : process.platform === "win32" ? "rundll32.exe" : "/usr/bin/xdg-open", args: process.platform === "win32" ? ["url.dll,FileProtocolHandler"] : [], env };
+}
+export async function openDefaultBrowser(url: string, override?: string) {
+  const link = authorizationUrl(url); if (!link) throw new AccountError("인증 링크가 올바르지 않습니다. 로그인을 다시 시작하세요.");
+  const launcher = await defaultBrowser(override);
+  try { await execute(launcher.command, [...launcher.args, link], { env: launcher.env, timeout: 10000, maxBuffer: 4096 }); }
+  catch { throw new AccountError("호스트의 기본 브라우저를 열지 못했습니다. 표시된 인증 링크를 Firefox에 붙여넣으세요."); }
+}
 const authVariables: Record<Harness, string[]> = {
   codex: ["OPENAI_API_KEY", "CODEX_API_KEY", "CODEX_ACCESS_TOKEN", "OPENAI_BASE_URL"],
   claude: ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CODE_OAUTH_REFRESH_TOKEN", "CLAUDE_CODE_OAUTH_SCOPES", "ANTHROPIC_BASE_URL",
@@ -42,7 +80,8 @@ export interface HarnessAdapter {
   usage(home: string, sessionId: string): Promise<UsageCounter>;
   resetIdentity(home: string, native?: boolean): Promise<string | null>;
   consumeReset(home: string, attemptId: string, creditId: string | null, native?: boolean, expectedIdentity?: string, retry?: boolean): Promise<ResetOutcome>;
-  login(home: string, native?: boolean): Promise<ChildProcess>;
+  login(home: string, native?: boolean, onAuthUrl?: (url: string) => void): Promise<ChildProcess>;
+  openLogin(url: string): Promise<void>;
   logout(home: string, native?: boolean): Promise<void>;
   transferHistory(source: string, target: string, sessionId: string): Promise<void>;
 }
@@ -157,29 +196,36 @@ export function createAdapters(commands: Partial<Record<Harness, string>> = {}, 
         }
         return codexConsumeReset(command, native ? nativeEnv(home) : processEnv(home), attemptId, creditId, native ? [] : credentialArgs);
       },
-      async login(home, native = false) {
+      async login(home, native = false, onAuthUrl) {
         if (!native) await adapter.prepare(home);
-        const env = native ? nativeEnv(home) : processEnv(home);
+        const launcher = await defaultBrowser(browserOpener);
+        const env = { ...(native ? nativeEnv(home) : processEnv(home)), ...Object.fromEntries(Object.entries(launcher.env).filter(([key]) => ["DISPLAY", "WAYLAND_DISPLAY", "XAUTHORITY", "XDG_CURRENT_DESKTOP", "XDG_SESSION_TYPE"].includes(key))) };
         delete env.BROWSER;
+        const directory = native ? browserRoot ?? join(process.env.PASEO_HOME ?? join(homedir(), ".paseo"), "harness-accounts", "browser") : home;
+        await privateDirectory(directory);
+        const capture = join(directory, `.auth-url-${harness}-${randomUUID()}.json`);
         if (process.platform !== "win32") {
-          const opener = browserOpener ?? (process.platform === "darwin" ? "/usr/bin/open" : "/usr/bin/xdg-open");
-          const directory = native ? browserRoot ?? join(process.env.PASEO_HOME ?? join(homedir(), ".paseo"), "harness-accounts", "browser") : home;
-          if (native) await privateDirectory(directory);
-          const helper = join(directory, native ? `${harness}.sh` : ".paseo-open-browser");
-          // Unset inherited browser bridges before using the OS launcher, including inside xdg-open itself.
-          await atomicWrite(helper, `#!/bin/sh\nunset BROWSER\ncase "$1" in\n  http://*|https://*) exec '${opener.replace(/'/g, "'\\''")}' "$1" ;;\n  *) exit 1 ;;\nesac\n`);
-          await chmod(helper, 0o700);
-          env.BROWSER = helper;
+          const helper = join(directory, native ? `${harness}.cjs` : ".paseo-open-browser.cjs");
+          // A private, short-lived file also captures links when the CLI silences its browser subprocess.
+          await atomicWrite(helper, `#!${process.execPath}\nconst fs=require('node:fs'),cp=require('node:child_process');\nconst url=process.argv[2];if(!/^https?:\\/\\//.test(url||''))process.exit(1);\ntry{fs.writeFileSync(${JSON.stringify(capture)},JSON.stringify({url}),{flag:'wx',mode:0o600});}catch{}\nconst env={...process.env};delete env.BROWSER;\ncp.spawnSync(${JSON.stringify(launcher.command)},[...${JSON.stringify(launcher.args)},url],{env,stdio:'ignore',timeout:10000});\n// Do not fall through to another browser if the OS launcher cannot open a window.\nprocess.exit(0);\n`);
+          await chmod(helper, 0o700); env.BROWSER = helper;
         }
-        const child = spawn(command, [...authArgs, ...(native ? [] : credentialArgs)], {
-          env, cwd: native ? homedir() : home, shell: false, stdio: "ignore",
-        });
-        await new Promise<void>((accept, reject) => {
-          child.once("spawn", accept);
-          child.once("error", () => reject(new AccountError(`${harnessLabels[harness]} CLI를 시작하지 못했습니다. 호스트의 설치 상태를 확인하세요.`)));
-        });
+        const child = spawn(command, [...authArgs, ...(native ? [] : credentialArgs)], { env, cwd: native ? homedir() : home, shell: false, stdio: ["ignore", "pipe", "pipe"] });
+        let active = true, lastUrl: string | null = null;
+        const publish = (value: string) => { const url = authorizationUrl(value); if (active && url && url !== lastUrl) { lastUrl = url; onAuthUrl?.(url); } };
+        // Output is inspected for allowlisted authorization URLs only; raw output never reaches logs/RPC.
+        for (const stream of [child.stdout, child.stderr]) { let buffer = "";
+          stream?.on("data", chunk => { buffer = (buffer + chunk.toString()).replace(/\x1b\[[0-9;]*[a-zA-Z]/g, "").slice(-32768); const at = buffer.lastIndexOf("\n"); if (at < 0) return;
+            for (const match of buffer.slice(0, at).matchAll(/https:\/\/[^\s<>"']+/g)) publish(match[0]); buffer = buffer.slice(at + 1); });
+          stream?.on("end", () => { for (const match of buffer.matchAll(/https:\/\/[^\s<>"']+/g)) publish(match[0]); });
+        }
+        const poll = setInterval(() => { void readFile(capture, "utf8").then(data => { try { publish(JSON.parse(data).url); } catch {} }).catch(() => {}); }, 100); poll.unref();
+        const cleanup = () => { active = false; clearInterval(poll); void unlink(capture).catch(() => {}); };
+        child.once("close", cleanup); child.once("error", cleanup);
+        await new Promise<void>((accept, reject) => { child.once("spawn", accept); child.once("error", () => reject(new AccountError(`${harnessLabels[harness]} CLI를 시작하지 못했습니다. 호스트의 설치 상태를 확인하세요.`))); });
         return child;
       },
+      openLogin(url) { return openDefaultBrowser(url, browserOpener); },
       async logout(home, native = false) {
         if (!native) await checkProfileFiles(home, harness);
         try {

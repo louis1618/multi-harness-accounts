@@ -54,7 +54,7 @@ async function agentsOn(paseo: PaseoApi, archived = false): Promise<AgentSummary
 export class AccountManager {
   readonly store: Store;
   readonly adapters: Record<Harness, HarnessAdapter>;
-  private jobs = new Map<string, { child: ChildProcess; timer: ReturnType<typeof setTimeout> }>();
+  private jobs = new Map<string, { child: ChildProcess | null; authUrl: string | null; timer: ReturnType<typeof setTimeout> }>();
   private loginErrors = new Map<string, string>();
   private loginSlots = new Map<Harness, string>();
   private restarting = new Set<string>();
@@ -116,11 +116,11 @@ export class AccountManager {
     const systemAccounts = await Promise.all((["codex", "claude"] as const).map(async harness => {
       try {
         const row = this.row(harness, null);
-        if (this.jobs.has(row)) return { harness, status: "authenticating" as const, email: null, error: null, metrics: metrics(harness, null, false, null) };
+        if (this.jobs.has(row)) return { harness, authUrl: this.jobs.get(row)!.authUrl, status: "authenticating" as const, email: null, error: null, metrics: metrics(harness, null, false, null) };
         const auth = await this.adapters[harness].status(this.adapters[harness].systemHome, true);
-        return { harness, status: auth.signedIn ? "signed-in" as const : "signed-out" as const, email: auth.email, error: this.loginErrors.get(row) ?? null,
+        return { harness, authUrl: null, status: auth.signedIn ? "signed-in" as const : "signed-out" as const, email: auth.email, error: this.loginErrors.get(row) ?? null,
           metrics: metrics(harness, null, auth.signedIn, auth.identity) };
-      } catch (error) { return { harness, status: "error" as const, email: null, error: this.publicError(error),
+      } catch (error) { return { harness, authUrl: null, status: "error" as const, email: null, error: this.publicError(error),
         metrics: metrics(harness, null, false, null) }; }
     }));
     const accounts = await Promise.all(state.accounts.map(async account => {
@@ -135,7 +135,7 @@ export class AccountManager {
           else if (error) status = "error";
         } catch (cause) { status = "error"; error = this.publicError(cause); }
       }
-      return { ...account, status, email, error, metrics: metrics(account.harness, account.id, status === "signed-in", identity) };
+      return { ...account, status, email, error, authUrl: status === "authenticating" ? this.jobs.get(account.id)?.authUrl ?? null : null, metrics: metrics(account.harness, account.id, status === "signed-in", identity) };
     }));
     if ([...identities].some(([row, identity]) => state.usage.identities[row] !== identity)) {
       await this.store.update(next => { for (const [row, identity] of identities) next.usage.identities[row] = identity; });
@@ -397,6 +397,13 @@ export class AccountManager {
       await this.driveRotation(action.agentId, paseo);
       return { message: "자동 전환 결과를 다시 확인했습니다." };
     }
+    if (action.action === "open-login-browser") {
+      if (action.accountId && this.account(await this.store.read(), action.accountId).harness !== action.harness) throw new AccountError("계정의 하네스가 올바르지 않습니다.");
+      const job = this.jobs.get(action.accountId ?? this.row(action.harness, null));
+      if (!job?.authUrl) throw new AccountError("인증 링크가 아직 준비되지 않았거나 로그인이 종료되었습니다. 다시 로그인하세요.");
+      await this.adapters[action.harness].openLogin(job.authUrl);
+      return { message: "호스트의 기본 브라우저에서 인증 링크를 다시 열었습니다." };
+    }
     if (action.action === "cancel-system-login") {
       this.cancelLogin(this.row(action.harness, null));
       return { message: "시스템 계정 로그인을 취소했습니다." };
@@ -548,15 +555,18 @@ export class AccountManager {
     if (this.jobs.has(account.id)) throw new AccountError("이 계정은 이미 로그인 중입니다.");
     this.claimLogin(account);
     this.loginErrors.delete(account.id);
-    let child: ChildProcess;
-    try { child = await this.adapters[account.harness].login(native ? this.adapters[account.harness].systemHome : this.profile(account), native); }
-    catch (error) { this.loginErrors.set(account.id, this.publicError(error)); throw error; }
     const timer = setTimeout(() => {
       this.cancelLogin(account.id);
       this.loginErrors.set(account.id, "10분 동안 로그인이 완료되지 않았습니다. 다시 로그인하세요.");
-    }, 10 * 60 * 1000);
-    timer.unref();
-    this.jobs.set(account.id, { child, timer });
+    }, 10 * 60 * 1000); timer.unref();
+    const job = { child: null as ChildProcess | null, timer, authUrl: null as string | null };
+    this.jobs.set(account.id, job);
+    let child: ChildProcess;
+    try { child = await this.adapters[account.harness].login(native ? this.adapters[account.harness].systemHome : this.profile(account), native,
+      url => { if (this.jobs.get(account.id) === job) job.authUrl = url; }); }
+    catch (error) { if (this.jobs.get(account.id) === job) this.cancelLogin(account.id); this.loginErrors.set(account.id, this.publicError(error)); throw error; }
+    if (this.jobs.get(account.id) !== job) { child.kill("SIGTERM"); throw new AccountError("로그인이 취소되었습니다."); }
+    job.child = child;
     child.once("exit", code => {
       if (this.jobs.get(account.id)?.child !== child) return;
       clearTimeout(timer);
@@ -585,7 +595,7 @@ export class AccountManager {
   }
   cancelLogin(id: string) {
     const job = this.jobs.get(id);
-    if (job) { this.jobs.delete(id); clearTimeout(job.timer); job.child.kill("SIGTERM"); }
+    if (job) { this.jobs.delete(id); clearTimeout(job.timer); job.child?.kill("SIGTERM"); }
     for (const [harness, accountId] of this.loginSlots) if (accountId === id) this.loginSlots.delete(harness);
   }
   async applyPending(id: string, paseo: PaseoApi) {
