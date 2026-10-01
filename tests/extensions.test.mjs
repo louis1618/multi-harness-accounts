@@ -15,7 +15,11 @@ import { randomUUID } from "node:crypto";
 import { setTimeout as delay } from "node:timers/promises";
 import { ExtensionManager } from "../.test-build/server/extensions.js";
 import { Store } from "../.test-build/server/store.js";
-import { ItemSchema, JobSchema } from "../.test-build/shared/extensions.js";
+import {
+  ItemSchema,
+  JobSchema,
+  commonInstallation,
+} from "../.test-build/shared/extensions.js";
 const sensitive = "fixture-credential-DO-NOT-COPY";
 async function put(path, value) {
   await mkdir(join(path, ".."), { recursive: true });
@@ -566,5 +570,37 @@ test("inline token flags and URL credentials stay private when sharing MCP confi
   assert.equal(
     new URL(cfg.mcpServers.web.url).searchParams.get("key"),
     "B-private",
+  );
+});
+
+test("common entries report actual installation before and after application", async (t) => {
+  const f = await fixture(t),
+    { ext, manager, a, b, target, finish } = f;
+  await put(join(manager.profile(a), "skills/shared/SKILL.md"), "# Shared");
+  await ext.common(target(a), ["skill:shared"]);
+  assert.equal(
+    (await ext.inventory(target(a))).common[0].installation,
+    "installed",
+  );
+  assert.equal((await ext.inventory(target(b))).items.length, 0);
+  assert.equal(
+    (await ext.inventory(target(b))).common[0].installation,
+    "missing",
+  );
+  const p = await ext.preview([target(b)]);
+  await finish((await ext.apply(p.id, [])).job.id);
+  const installed = await ext.inventory(target(b));
+  assert.equal(installed.common[0].installation, "installed");
+  assert.equal(
+    installed.items.find((x) => x.key === "skill:shared").common,
+    true,
+  );
+  await put(
+    join(manager.profile(b), "skills/shared/SKILL.md"),
+    "# Account addition",
+  );
+  assert.equal(
+    (await ext.inventory(target(b))).common[0].installation,
+    "different",
   );
 });

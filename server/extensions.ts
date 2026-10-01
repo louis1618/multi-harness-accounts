@@ -17,6 +17,7 @@ import {
   TargetSchema,
   JobSchema,
   ItemSchema,
+  commonInstallation,
   type Target,
   type Kind,
   type ExtensionItem,
@@ -812,7 +813,18 @@ export class ExtensionManager {
         ...x.view,
         common: commonKeys.has(x.view.key),
       })),
-      common: common.map((x) => ({ ...x.view, common: true })),
+      common: common.map((x) => ({
+        ...x.view,
+        common: true,
+        installation: commonInstallation(
+          x.view,
+          items.find(
+            (item) =>
+              item.view.key === x.view.key &&
+              (item.view.scope === t.scope || item.view.scope === "host"),
+          )?.view,
+        ),
+      })),
       warnings: [...new Set(warnings)],
       version,
       autoNew: this.state.autoNew,
@@ -864,7 +876,8 @@ export class ExtensionManager {
       if (autoSwitch !== undefined) this.state.autoSwitch = autoSwitch;
       await this.save();
       return {
-        message: "공통 구성을 저장했습니다. 계정 전용 항목은 유지됩니다.",
+        message:
+          "공통 구성을 저장했습니다. 다른 계정에는 ‘계정에 적용’을 눌러 설치하세요.",
       };
     });
   }
@@ -1743,6 +1756,7 @@ export class ExtensionManager {
       { harness, accountId, scope: "user", sessionId: null },
     ]);
     if (p.steps.some((s) => s.action === "add")) await this.apply(p.id, []);
+    else this.plans.delete(p.id);
   }
   dispose() {
     this.disposed = true;

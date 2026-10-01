@@ -225,19 +225,37 @@ export function ExtensionsPanel({
     if (detailQuery.data && !editing) setValue(detailQuery.data.text);
   }, [detailQuery.data, editing]);
   useEffect(() => {
-    if (
-      jobs.data?.jobs.some((j) => j.status === "done" || j.status === "error")
-    )
+    if (jobs.data?.jobs.length)
       void qc.invalidateQueries({ queryKey: ["extensions", host.id] });
-  }, [jobs.data?.jobs.map((j) => j.status).join(",")]);
+  }, [
+    jobs.data?.jobs
+      .map(
+        (j) => `${j.id}:${j.status}:${j.steps.map((s) => s.status).join(",")}`,
+      )
+      .join(";"),
+  ]);
   const toggle = (xs: string[], x: string) =>
     xs.includes(x) ? xs.filter((v) => v !== x) : [...xs, x];
   const items =
     (common ? query.data?.common : query.data?.items)?.filter(
       (r) =>
-        (filter === "all" || r.kind === filter) &&
-        r.name.toLowerCase().includes(search.toLowerCase()),
+        common ||
+        ((filter === "all" || r.kind === filter) &&
+          r.name.toLowerCase().includes(search.toLowerCase())),
     ) ?? [];
+  const missingCommon =
+    query.data?.common.filter((r) => r.installation === "missing") ?? [];
+  const startApply = () => {
+    op.reset();
+    setPlan(null);
+    setTargets([accountId ?? "system"]);
+    setReplacements([]);
+    setDialog("apply");
+  };
+  useEffect(() => {
+    setSearch("");
+    setFilter("all");
+  }, [harness, accountId, scope, sessionId]);
   const act = (action: Parameters<typeof mutate>[0]["action"]) => {
     if (!item) return;
     op.mutate(async () => {
@@ -375,9 +393,22 @@ export function ExtensionsPanel({
       </View>
       {common && (
         <Text style={body}>
-          여러 계정에서 함께 사용할 항목입니다. 적용할 때 계정 전용 항목은
-          유지됩니다.
+          이 계정의 실제 설치 상태를 함께 표시합니다. 공통 구성 저장 후 다른
+          계정에는 ‘계정에 적용’을 눌러 설치하세요.
         </Text>
+      )}
+      {!common && missingCommon.length > 0 && (
+        <View style={{ gap: 10 }}>
+          <Text style={body}>
+            이 계정에 아직 설치하지 않은 공통 항목이 {missingCommon.length}개
+            있습니다.
+          </Text>
+          <View style={{ alignItems: "flex-start" }}>
+            <Button colors={c} disabled={busy} onPress={startApply}>
+              빠진 공통 항목 설치
+            </Button>
+          </View>
+        </View>
       )}
       {!common && (
         <View
@@ -461,7 +492,7 @@ export function ExtensionsPanel({
                 setNotice(
                   common
                     ? "공통 구성에서 제외했습니다. 설치된 항목은 유지됩니다."
-                    : "공통 구성에 저장했습니다.",
+                    : "공통 구성을 저장했습니다. 다른 계정에는 ‘계정에 적용’을 눌러 설치하세요.",
                 );
               })
             }
@@ -519,6 +550,13 @@ export function ExtensionsPanel({
                   kinds[r.kind],
                   r.version,
                   r.common && !common ? "공통 구성" : null,
+                  common
+                    ? r.installation === "missing"
+                      ? "이 계정에 미설치"
+                      : r.installation === "different"
+                        ? "설치됨 · 공통 구성과 다름"
+                        : r.installation === "installed" ? "이 계정에 설치됨" : "설치 상태 확인 중"
+                    : null,
                   !r.enabled ? "비활성" : null,
                   r.scope === "host"
                     ? "호스트 공통"

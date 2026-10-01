@@ -26,9 +26,22 @@ export const ItemSchema = z
     components: z.array(z.string()),
     fingerprint: z.string(),
     common: z.boolean(),
+    installation: z.enum(["installed", "different", "missing"]).optional(),
   })
   .strict();
 export type ExtensionItem = z.infer<typeof ItemSchema>;
+export function commonInstallation(
+  expected: ExtensionItem,
+  actual?: ExtensionItem,
+): "installed" | "different" | "missing" {
+  if (!actual) return "missing";
+  return actual.fingerprint === expected.fingerprint ||
+    (expected.kind === "plugin" &&
+      actual.version === expected.version &&
+      actual.enabled === expected.enabled)
+    ? "installed"
+    : "different";
+}
 const StepSchema = z
   .object({
     target: TargetSchema,
