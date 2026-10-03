@@ -241,3 +241,15 @@ test("authorization links are temporary, allowlisted, reopen on the host and nev
   }
   const launcher=await defaultBrowser();if(process.platform==='linux'){assert.ok(launcher.command==='/usr/bin/gio'||launcher.command==='/usr/bin/xdg-open');}
 });
+
+test("CLI runtime errors are not treated as signed-out responses", async t => {
+  const root=await temporary(t), command=join(root,'status-fixture');
+  await writeFile(command, '#!/usr/bin/env node\nconsole.log(JSON.stringify({error:"runtime failed"}));process.exit(2);\n', {mode:0o700});
+  const adapters=createAdapters({codex:command,claude:command});
+  await assert.rejects(adapters.claude.status(root),/확인하지 못했습니다/);
+  await assert.rejects(adapters.codex.status(root,true),/확인하지 못했습니다/);
+  await writeFile(command, '#!/usr/bin/env node\nconsole.log(JSON.stringify({loggedIn:false}));process.exit(1);\n', {mode:0o700});
+  assert.equal((await adapters.claude.status(root)).signedIn,false);
+  await writeFile(command, '#!/usr/bin/env node\nconsole.error("Not logged in");process.exit(1);\n', {mode:0o700});
+  assert.equal((await adapters.codex.status(root,true)).signedIn,false);
+});

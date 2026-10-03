@@ -96,7 +96,7 @@ export class AccountManager {
       void this.driveRotation(id, paseo).catch(() => {});
     const identities = new Map<string, string>();
     const statisticsRows = new Map<string, string>();
-    const metrics = (harness: Harness, id: string | null, signedIn: boolean, identity: string | null): Metrics => {
+    const metrics = (harness: Harness, id: string | null, signedIn: boolean, identity: string | null, lookupFailed = false): Metrics => {
       const row = this.row(harness, id);
       if (signedIn && identity) identities.set(row, identity);
       const principal = signedIn ? identity : state.usage.identities[row] ?? null;
@@ -107,7 +107,8 @@ export class AccountManager {
       const home = id ? this.profile(this.account(state, id)) : this.adapters[harness].systemHome;
       return {
         quota: signedIn ? this.quotas.get(`${row}:${identity ?? "unknown"}`,
-          signal => this.adapters[harness].quota(home, id === null, signal), forceUsage) : unavailableQuota("로그인하면 한도를 확인할 수 있습니다."),
+          signal => this.adapters[harness].quota(home, id === null, signal), forceUsage) : unavailableQuota(lookupFailed
+            ? "로그인 상태를 조회하지 못했습니다. 잠시 후 다시 조회하세요." : "로그인하면 한도를 확인할 수 있습니다."),
         statistics: { ...totals, totalTokens: totals.inputTokens + totals.outputTokens, available: principal !== null, startedAt: state.usage.startedAt },
         isMostRecent: state.usage.mostRecentRow === row && state.usage.mostRecentIdentity === principal,
         sharedStatisticsWith,
@@ -118,10 +119,11 @@ export class AccountManager {
         const row = this.row(harness, null);
         if (this.jobs.has(row)) return { harness, authUrl: this.jobs.get(row)!.authUrl, status: "authenticating" as const, email: null, error: null, metrics: metrics(harness, null, false, null) };
         const auth = await this.adapters[harness].status(this.adapters[harness].systemHome, true);
+        if (auth.signedIn) this.loginErrors.delete(row);
         return { harness, authUrl: null, status: auth.signedIn ? "signed-in" as const : "signed-out" as const, email: auth.email, error: this.loginErrors.get(row) ?? null,
           metrics: metrics(harness, null, auth.signedIn, auth.identity) };
       } catch (error) { return { harness, authUrl: null, status: "error" as const, email: null, error: this.publicError(error),
-        metrics: metrics(harness, null, false, null) }; }
+        metrics: metrics(harness, null, false, null, true) }; }
     }));
     const accounts = await Promise.all(state.accounts.map(async account => {
       let status: Snapshot["accounts"][number]["status"] = this.jobs.has(account.id) ? "authenticating" : "signed-out";
@@ -131,11 +133,12 @@ export class AccountManager {
       if (status !== "authenticating") {
         try {
           const auth = await this.adapters[account.harness].status(this.profile(account));
-          if (auth.signedIn) { status = "signed-in"; email = auth.email; identity = auth.identity; }
+          if (auth.signedIn) { status = "signed-in"; email = auth.email; identity = auth.identity;
+            error = null; this.loginErrors.delete(account.id); }
           else if (error) status = "error";
         } catch (cause) { status = "error"; error = this.publicError(cause); }
       }
-      return { ...account, status, email, error, authUrl: status === "authenticating" ? this.jobs.get(account.id)?.authUrl ?? null : null, metrics: metrics(account.harness, account.id, status === "signed-in", identity) };
+      return { ...account, status, email, error, authUrl: status === "authenticating" ? this.jobs.get(account.id)?.authUrl ?? null : null, metrics: metrics(account.harness, account.id, status === "signed-in", identity, status === "error") };
     }));
     if ([...identities].some(([row, identity]) => state.usage.identities[row] !== identity)) {
       await this.store.update(next => { for (const [row, identity] of identities) next.usage.identities[row] = identity; });

@@ -135,8 +135,10 @@ export function createAdapters(commands: Partial<Record<Harness, string>> = {}, 
             try { await execute(command, ["login", "status"], { env: statusEnv, timeout: 10000, maxBuffer: 65536 }); signedIn = true; }
             catch (error) {
               if ((error as NodeJS.ErrnoException).code === "ENOENT") throw new AccountError("이 호스트에 Codex CLI가 설치되지 않았습니다.");
-              if (typeof (error as { code?: unknown }).code !== "number") throw new AccountError("Codex 로그인 상태를 확인하지 못했습니다.");
-              return { signedIn: false, email: null, identity: null };
+              const failed = error as { code?: unknown; stdout?: string; stderr?: string };
+              if (failed.code === 1 && /not logged in|logged out|no credentials/i.test(`${failed.stdout ?? ""} ${failed.stderr ?? ""}`))
+                return { signedIn: false, email: null, identity: null };
+              throw new AccountError("Codex 로그인 상태를 확인하지 못했습니다. 잠시 후 다시 조회하세요.");
             }
           }
           try {
@@ -160,6 +162,7 @@ export function createAdapters(commands: Partial<Record<Harness, string>> = {}, 
             env: statusEnv, timeout: 10000, maxBuffer: 65536,
           });
           const status = JSON.parse(stdout);
+          if (typeof status.loggedIn !== "boolean") throw new Error();
           const email = typeof status.email === "string" && status.email.length < 255 ? status.email : null;
           let oauth: { accountUuid?: string; organizationUuid?: string } = {};
           const metadata = native && !statusEnv.CLAUDE_CONFIG_DIR && resolve(home) === nativeHome
@@ -173,9 +176,12 @@ export function createAdapters(commands: Partial<Record<Harness, string>> = {}, 
               typeof oauth.organizationUuid === "string" ? oauth.organizationUuid : "") };
         } catch (error) {
           if ((error as NodeJS.ErrnoException).code === "ENOENT") throw new AccountError("이 호스트에 Claude Code CLI가 설치되지 않았습니다.");
-          // CLI versions may exit nonzero for a normal signed-out status.
-          if (typeof (error as { code?: unknown }).code === "number") return { signedIn: false, email: null, identity: null };
-          throw new AccountError("Claude Code 로그인 상태를 확인하지 못했습니다.");
+          // Only a verified signed-out response means logout; crashes and timeouts are lookup errors.
+          try {
+            if (JSON.parse((error as { stdout?: string }).stdout ?? "").loggedIn === false)
+              return { signedIn: false, email: null, identity: null };
+          } catch { /* An invalid or absent status must not be interpreted as logout. */ }
+          throw new AccountError("Claude Code 로그인 상태를 확인하지 못했습니다. 잠시 후 다시 조회하세요.");
         }
       },
       async quota(home, native = false, signal) {

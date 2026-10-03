@@ -244,3 +244,108 @@ test("an existing idle system session is primed before its first post-update tur
   assert.equal(usage.statistics.totalTokens, 12); assert.equal(usage.statistics.incompleteTurns, 0);
   assert.equal(usage.isMostRecent, true);
 });
+
+test("Claude renews expired credentials once across concurrent reads and preserves other credentials", async t => {
+  const home = await temporary(t), path = join(home, ".credentials.json");
+  await writeFile(path, JSON.stringify({ mcpOAuth: { keep: "unchanged" }, claudeAiOauth: {
+    accessToken: "old-private-access", refreshToken: "old-private-refresh", expiresAt: 1,
+    scopes: ["user:profile", "user:inference"], subscriptionType: "max", rateLimitTier: "preserved",
+  } }));
+  let renewals = 0;
+  const fetchApi = async (url, options) => {
+    if (url.endsWith("/v1/oauth/token")) {
+      renewals++;
+      assert.equal(options.redirect, "error");
+      const body = JSON.parse(options.body);
+      assert.equal(body.grant_type, "refresh_token");
+      assert.equal(body.refresh_token, "old-private-refresh");
+      assert.equal(body.scope, "user:profile user:inference");
+      await new Promise(r => setTimeout(r, 50));
+      return new Response(JSON.stringify({ access_token: "new-private-access", refresh_token: "new-private-refresh", expires_in: 28800, refresh_token_expires_in: 2592000 }));
+    }
+    assert.equal(options.method, "GET");
+    assert.equal(options.headers.Authorization, "Bearer new-private-access");
+    return new Response(JSON.stringify({ five_hour: { utilization: 20 } }));
+  };
+  const quotas = await Promise.all([claudeQuota(home, fetchApi), claudeQuota(home, fetchApi)]);
+  assert.equal(renewals, 1);
+  assert(quotas.every(q => q.status === "available"));
+  assert(!JSON.stringify(quotas).includes("private"));
+  const stored = JSON.parse(await readFile(path, "utf8"));
+  assert.equal(stored.mcpOAuth.keep, "unchanged");
+  assert.equal(stored.claudeAiOauth.rateLimitTier, "preserved");
+  assert(stored.claudeAiOauth.expiresAt > Date.now());
+  assert(stored.claudeAiOauth.refreshTokenExpiresAt > stored.claudeAiOauth.expiresAt);
+  const { lstat } = await import("node:fs/promises");
+  assert.equal((await lstat(path)).mode & 0o777, 0o600);
+  await assert.rejects(lstat(join(home, ".oauth_refresh.lock")), { code: "ENOENT" });
+  await assert.rejects(lstat(home + ".lock"), { code: "ENOENT" });
+});
+
+test("Claude retries a rejected token once but keeps permission errors separate from login expiry", async t => {
+  const home = await temporary(t), path = join(home, ".credentials.json");
+  const credentials = () => JSON.stringify({ claudeAiOauth: { accessToken: "old-access", refreshToken: "old-refresh", expiresAt: Date.now() + 3600000 } });
+  await writeFile(path, credentials());
+  let reads = 0, renewals = 0;
+  const fetchApi = async (url, options) => {
+    if (url.endsWith("/v1/oauth/token")) { renewals++; return new Response(JSON.stringify({ access_token: "new-access", refresh_token: "new-refresh", expires_in: 28800 })); }
+    reads++;
+    return options.headers.Authorization === "Bearer old-access" ? new Response("", { status: 401 }) : new Response(JSON.stringify({ seven_day: { utilization: 30 } }));
+  };
+  assert.equal((await claudeQuota(home, fetchApi)).status, "available");
+  assert.equal(reads, 2); assert.equal(renewals, 1);
+  const before = await readFile(path, "utf8"); let forbiddenCalls = 0;
+  await assert.rejects(claudeQuota(home, async (_, options) => {
+    forbiddenCalls++; assert.equal(options.method, "GET"); return new Response("permission denied", { status: 403 });
+  }), e => e.status === "error" && !e.message.includes("다시 로그인"));
+  assert.equal(forbiddenCalls, 1); assert.equal(await readFile(path, "utf8"), before);
+});
+
+test("only rejected refresh grants require relogin; transient renewal errors preserve credentials", async t => {
+  const home = await temporary(t), path = join(home, ".credentials.json");
+  const before = JSON.stringify({ claudeAiOauth: { accessToken: "old-access", refreshToken: "private-refresh", expiresAt: 1 } });
+  await writeFile(path, before);
+  for (const [code, error, status] of [[400, "invalid_grant", "auth-required"], [503, "unavailable", "error"]]) {
+    await assert.rejects(claudeQuota(home, async (url, options) => {
+      assert(url.endsWith("/v1/oauth/token")); assert.equal(options.method, "POST");
+      return new Response(JSON.stringify({ error, error_description: "private-refresh" }), { status: code });
+    }), e => e.status === status && !e.message.includes("private-refresh"));
+    assert.equal(await readFile(path, "utf8"), before);
+  }
+});
+
+test("Codex recovers a quota 401 through native account refresh without a login or model request", async t => {
+  const root = await temporary(t), command = join(root, "codex-refresh-fixture"), trace = join(root, "calls.jsonl");
+  await writeFile(command, `#!/usr/bin/env node
+const fs=require('node:fs');let fresh=false;
+require('node:readline').createInterface({input:process.stdin}).on('line',line=>{
+ const v=JSON.parse(line);if(v.id===undefined)return;
+ fs.appendFileSync(${JSON.stringify(trace)},JSON.stringify({method:v.method,params:v.params})+'\\n');
+ if(!['initialize','account/read','account/rateLimits/read'].includes(v.method))throw Error('unexpected operation');
+ if(v.method==='account/read'&&v.params.refreshToken)fresh=true;
+ const result=v.method==='initialize'?{}:v.method==='account/read'?{account:{type:'chatgpt',planType:'pro'}}:{rateLimits:{primary:{usedPercent:25,windowDurationMins:300}}};
+ console.log(JSON.stringify(v.method==='account/rateLimits/read'&&!fresh?{id:v.id,error:{code:401,message:'Unauthorized'}}:{id:v.id,result}));
+});
+`, { mode: 0o700 });
+  assert.equal((await codexQuota(command, process.env)).status, "available");
+  const calls = (await readFile(trace, "utf8")).trim().split("\n").map(JSON.parse);
+  assert.deepEqual(calls.filter(c => c.method === "account/read").map(c => c.params.refreshToken), [false, true]);
+  assert.equal(calls.filter(c => c.method === "account/rateLimits/read").length, 2);
+});
+
+test("failed login-state lookups and recovered old login errors do not ask a valid account to login again", async t => {
+  const root = await temporary(t), adapters = createAdapters(), id = randomUUID();
+  for (const h of ['codex','claude']) adapters[h].status = async () => { throw Error('lookup failed'); };
+  const manager = new AccountManager({root, adapters});t.after(()=>manager.dispose());
+  await manager.store.update(s=>s.accounts.push({id,harness:'claude',label:'A',createdAt:new Date().toISOString()}));
+  const paseo={agents:{async list(){return {entries:[],pageInfo:{hasMore:false,nextCursor:null}};}}};
+  let snapshot=await manager.snapshot(paseo);
+  assert.equal(snapshot.accounts[0].status,'error');assert(!snapshot.accounts[0].metrics.quota.error.includes('로그인하면'));
+  assert(snapshot.systemAccounts.every(r=>!r.metrics.quota.error.includes('로그인하면')));
+  adapters.claude.status=async()=>({signedIn:true,email:'fixture@example.test',identity:'e'.repeat(64)});
+  adapters.claude.quota=async()=>parseClaudeQuota({});
+  manager.loginErrors.set(id,'다시 로그인하세요.');manager.loginErrors.set('system:claude','다시 로그인하세요.');
+  snapshot=await manager.snapshot(paseo);
+  assert.equal(snapshot.accounts[0].status,'signed-in');assert.equal(snapshot.accounts[0].error,null);
+  assert.equal(snapshot.systemAccounts.find(r=>r.harness==='claude').error,null);
+});

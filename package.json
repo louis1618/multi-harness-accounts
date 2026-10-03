@@ -1,7 +1,7 @@
 {
   "name": "multi-harness-accounts",
   "private": true,
-  "version": "1.4.2",
+  "version": "1.4.3",
   "type": "module",
   "files": [
     "paseo-plugin.json",
@@ -20,6 +20,7 @@
     "test:extensions-native": "npm test && node tests/extensions-native-smoke.mjs"
   },
   "devDependencies": {
+    "@types/proper-lockfile": "4.1.4",
     "@getpaseo/client": "0.10.0",
     "@getpaseo/plugin": "0.10.0",
     "@tanstack/react-query": "^5.90.11",
@@ -31,6 +32,7 @@
     "zod": "^4.4.3"
   },
   "dependencies": {
+    "proper-lockfile": "4.1.2",
     "smol-toml": "1.9.0"
   }
 }

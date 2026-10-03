@@ -16,7 +16,7 @@ const compact = (value: number) => new Intl.NumberFormat("ko-KR", { notation: "c
 const date = (value: string) => new Intl.DateTimeFormat("ko-KR", { year: "numeric", month: "short", day: "numeric", hour: "numeric", minute: "2-digit" }).format(new Date(value));
 const errorMessage = (error: Error | null) => {
   const message = error?.message ?? "", start = message.search(/[가-힣]/);
-  return start >= 0 ? message.slice(start).split(" requestType=")[0] : "작업을 완료하지 못했습니다. 로그인과 연결 상태를 확인하고 다시 시도하세요.";
+  return start >= 0 ? message.slice(start).split(" requestType=")[0] : "작업을 완료하지 못했습니다. 연결 상태를 확인하고 다시 시도하세요.";
 };
 const statusLabel: Record<string, string> = { idle: "대기 중", running: "실행 중", initializing: "준비 중", closed: "닫힌 세션", error: "확인 필요" };
 function Badge({ children, colors, active = false }: { children: ReactNode; colors: Colors; active?: boolean }) {
@@ -142,7 +142,7 @@ export function AccountsSurface({ theme, layout, host, initialAgentId }: PluginS
   const colors = theme.colors, list = useRpc(listAccounts), change = useRpc(changeAccount);
   const fetchSessions = useRpc(listSessions), importSession = useRpc(importAccountSession);
   const prepare = useRpc(prepareReset), consume = useRpc(consumeReset), queryClient = useQueryClient();
-  const [tab, setTab] = useState<"usage" | "accounts" | "extensions">(initialAgentId ? "accounts" : "usage");
+  const [tab, setTab] = useState<"usage" | "accounts" | "extensions">("accounts");
   const [agentId, setAgentId] = useState(initialAgentId ?? "");
   const [adding, setAdding] = useState<Harness | null>(null), [label, setLabel] = useState("");
   const [confirmation, setConfirmation] = useState<{ kind: "relogin" | "remove" | "logout"; row: Row } | null>(null);
@@ -202,7 +202,7 @@ export function AccountsSurface({ theme, layout, host, initialAgentId }: PluginS
     <ScrollView style={{ flex: 1, backgroundColor: colors.surface0 }} contentContainerStyle={{
       padding: layout.compact ? 16 : 28, gap: 28, width: "100%", maxWidth: 1100, alignSelf: "center" }}>
       <View accessibilityRole="tablist" style={{ flexDirection: "row", gap: 24, borderBottomWidth: 1, borderColor: colors.border }}>
-        {(["usage", "accounts", "extensions"] as const).map(value => <Pressable key={value} accessibilityRole="tab" accessibilityState={{ selected: tab === value }} aria-selected={tab === value}
+        {(["accounts", "usage", "extensions"] as const).map(value => <Pressable key={value} accessibilityRole="tab" accessibilityState={{ selected: tab === value }} aria-selected={tab === value}
           onPress={() => setTab(value)} style={{ flexDirection: "row", alignItems: "center", gap: 8, paddingVertical: 14,
             borderBottomWidth: 2, borderBottomColor: tab === value ? colors.accent : "transparent" }}>
           <Icon name={value === "usage" ? "ChartNoAxesCombined" : value === "accounts" ? "Users" : "Blocks"} size={18} color={tab === value ? colors.foreground : colors.foregroundMuted} />
@@ -238,7 +238,7 @@ export function AccountsSurface({ theme, layout, host, initialAgentId }: PluginS
                   {row.metrics.isMostRecent && <Badge colors={colors}>최근 사용</Badge>}
                   {row.metrics.quota.plan && <Badge colors={colors}>{row.metrics.quota.plan}</Badge>}
                 </View>
-                <Text style={detail}>{row.email ?? (row.status === "authenticating" ? "브라우저 인증 대기 중…" : row.status === "signed-in" ? "로그인됨 · 이메일 미제공" : "로그인 필요")}</Text>
+                <Text style={detail}>{row.email ?? (row.status === "authenticating" ? "브라우저 인증 대기 중…" : row.status === "signed-in" ? "로그인됨 · 이메일 미제공" : row.status === "error" ? "로그인 상태 조회 오류" : "로그인 필요")}</Text>
                 {!row.id && <Text style={{ ...detail, fontSize: 12 }}>이 호스트의 기본 CLI 로그인</Text>}
               </View>
               <View style={{ flexDirection: "row", flexWrap: "wrap", justifyContent: "flex-end", gap: 8 }}>

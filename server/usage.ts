@@ -1,8 +1,10 @@
 import { createHash } from "node:crypto";
 import { spawn } from "node:child_process";
-import { readFile, readdir, lstat } from "node:fs/promises";
+import { readFile, readdir, lstat, realpath } from "node:fs/promises";
+import { lock } from "proper-lockfile";
 import { createInterface } from "node:readline";
 import { join } from "node:path";
+import { atomicWrite } from "./store.js";
 import { emptyTokens, QuotaSchema, type Harness, type Quota, type ResetOutcome, type TokenTotals, type UsageCounter } from "../shared/accounts.js";
 
 export const emptyCounter = (): UsageCounter => ({ totals: emptyTokens(), observed: false, complete: true });
@@ -15,7 +17,7 @@ export class QuotaError extends Error {
 
 /** Only account metadata RPCs; no threads, prompts, OAuth start, or external token injection. */
 async function codexAccount<T>(command: string, env: NodeJS.ProcessEnv, signal: AbortSignal | undefined, credentialArgs: string[],
-  operation: (request: (method: string, params?: unknown) => Promise<any>, account: any) => Promise<T>): Promise<T> {
+  operation: (request: (method: string, params?: unknown) => Promise<any>, account: any) => Promise<T>, recoverAuth = true): Promise<T> {
   const child = spawn(command, ["app-server", ...credentialArgs], { env, shell: false, stdio: ["pipe", "pipe", "ignore"] });
   const pending = new Map<number, { resolve: (value: any) => void; reject: (error: Error) => void }>();
   let sequence = 0;
@@ -37,13 +39,13 @@ async function codexAccount<T>(command: string, env: NodeJS.ProcessEnv, signal: 
     pending.delete(value.id);
     if (value.error) {
       const code = value.error.code;
-      const auth = code === 401 || code === 403 || /401|403|unauthorized|not authenticated|not logged in/i.test(String(value.error.message));
+      const auth = code === 401 || /\b401\b|unauthorized|not authenticated|not logged in|(?:refresh|access)[ _-]?token[^\n]{0,60}(?:expired|revoked|reused)/i.test(String(value.error.message));
       request.reject(new QuotaError(auth ? "auth-required" : code === -32601 ? "unavailable" : "error",
         auth ? "한도 조회에 다시 로그인이 필요합니다." : code === -32601 ? "이 Codex 버전은 한도 조회를 지원하지 않습니다." : "Codex 한도를 조회하지 못했습니다. 잠시 후 새로고침하세요."));
     } else request.resolve(value.result);
   });
   const abort = () => { fail(); child.kill("SIGTERM"); };
-  const timer = setTimeout(abort, 10000);
+  const timer = setTimeout(abort, 30000);
   signal?.addEventListener("abort", abort, { once: true });
   const request = (method: string, params?: unknown) => new Promise<any>((resolve, reject) => {
     if (signal?.aborted || child.exitCode !== null) { reject(new QuotaError("error", "한도 조회가 중단되었습니다.")); return; }
@@ -54,10 +56,17 @@ async function codexAccount<T>(command: string, env: NodeJS.ProcessEnv, signal: 
   try {
     await request("initialize", { clientInfo: { name: "paseo-account-usage", version: "1.1.0" }, capabilities: {} });
     child.stdin.write(JSON.stringify({ method: "initialized" }) + "\n");
-    const auth = await request("account/read", { refreshToken: false });
-    if (!auth.account) throw new QuotaError("auth-required", "한도 조회에 로그인이 필요합니다.");
-    if (auth.account.type !== "chatgpt") throw new QuotaError("unavailable", "이 인증 방식은 구독 한도를 제공하지 않습니다.");
-    return await operation(request, auth.account);
+    const run = async (refreshToken: boolean) => {
+      const auth = await request("account/read", { refreshToken });
+      if (!auth.account) throw new QuotaError("auth-required", "저장된 인증을 복구하지 못했습니다. 다시 로그인하세요.");
+      if (auth.account.type !== "chatgpt") throw new QuotaError("unavailable", "이 인증 방식은 구독 한도를 제공하지 않습니다.");
+      return operation(request, auth.account);
+    };
+    try { return await run(false); }
+    catch (error) {
+      if (!recoverAuth || !(error instanceof QuotaError) || error.status !== "auth-required") throw error;
+      return await run(true);
+    }
   } finally {
     clearTimeout(timer); signal?.removeEventListener("abort", abort); reader.close();
     child.kill("SIGTERM");
@@ -77,7 +86,7 @@ export function codexConsumeReset(command: string, env: NodeJS.ProcessEnv, attem
     if (!["reset", "alreadyRedeemed", "nothingToReset", "noCredit"].includes(response?.outcome))
       throw new QuotaError("error", "리셋 결과를 확인하지 못했습니다. 같은 요청으로 다시 확인하세요.");
     return response.outcome as "reset" | "alreadyRedeemed" | "nothingToReset" | "noCredit";
-  });
+  }, false);
 }
 
 const date = (value: unknown, seconds = false): string | null => {
@@ -188,15 +197,73 @@ export function parseClaudeResetCredits(block: any): NonNullable<Quota["resetCre
   return { eligible: block.eligible, reason, availableCount: credits.reduce((sum: number, credit: { remaining: number; expiresAt: string | null }) =>
     sum + (credit.expiresAt && Date.parse(credit.expiresAt) <= Date.now() ? 0 : credit.remaining), 0), credits };
 }
-async function claudeAccount(home: string, fetchApi: typeof fetch, signal?: AbortSignal) {
-  let oauth;
+async function claudeCredentials(home: string) {
   try {
     const path = join(home, ".credentials.json"), stat = await lstat(path);
-    if (!stat.isFile() || stat.isSymbolicLink()) throw new Error();
-    oauth = JSON.parse(await readFile(path, "utf8")).claudeAiOauth;
+    if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 1024 * 1024) throw new Error();
+    return JSON.parse(await readFile(path, "utf8"));
   } catch { throw new QuotaError("unavailable", "이 계정의 한도 조회용 인증 정보를 읽을 수 없습니다."); }
+}
+// Same OAuth endpoint and both refresh locks as the installed Claude Code 2.1.287.
+// Keep authentication renewal independent of model requests, prompts and reset redemption.
+async function refreshClaude(home: string, fetchApi: typeof fetch, signal?: AbortSignal, rejectedToken?: string) {
+  const initial = (await claudeCredentials(home)).claudeAiOauth;
+  if (!initial?.refreshToken || rejectedToken && initial.accessToken !== rejectedToken ||
+    !rejectedToken && !(typeof initial.expiresAt === "number" && initial.expiresAt <= Date.now() + 120000)) return initial;
+  const releases: (() => Promise<void>)[] = [];
+  const controller = new AbortController(), abort = () => controller.abort();
+  const timer = setTimeout(abort, 20000);
+  signal?.addEventListener("abort", abort, { once: true });
+  let compromised = false;
+  try {
+    const stat = await lstat(home);
+    if (!stat.isDirectory() || stat.isSymbolicLink()) throw Error();
+    const legacy = (await realpath(home)) + ".lock";
+    for (const [target, path] of [[home, join(home, ".oauth_refresh.lock")], [legacy, legacy]])
+      releases.push(await lock(target, { lockfilePath: path, realpath: false, stale: 60000, update: 5000,
+        retries: { retries: 5, minTimeout: 200, maxTimeout: 1000 }, onCompromised: () => { compromised = true; abort(); } }));
+    const current = (await claudeCredentials(home)).claudeAiOauth;
+    if (current?.accessToken !== initial.accessToken || current?.refreshToken !== initial.refreshToken) return current;
+    if (signal?.aborted || controller.signal.aborted) throw Error();
+    const response = await fetchApi("https://platform.claude.com/v1/oauth/token", {
+      method: "POST", redirect: "error", signal: controller.signal,
+      headers: { "Content-Type": "application/json", Accept: "application/json" },
+      body: JSON.stringify({ grant_type: "refresh_token", refresh_token: current.refreshToken,
+        client_id: current.clientId ?? "9d1c250a-e61b-44d9-88ed-5944d1962f5e", ...(Array.isArray(current.scopes) && current.scopes.length ? { scope: current.scopes.join(" ") } : {}) }),
+    });
+    let tokens: any;
+    try { tokens = await response.json(); } catch { throw Error(); }
+    const latest = await claudeCredentials(home);
+    if (latest.claudeAiOauth?.accessToken !== current.accessToken || latest.claudeAiOauth?.refreshToken !== current.refreshToken)
+      return latest.claudeAiOauth;
+    if (!response.ok) {
+      if (tokens?.error === "invalid_grant") throw new QuotaError("auth-required", "인증 자동 갱신으로 복구하지 못했습니다. 이 계정에 다시 로그인하세요.", 300000);
+      throw Error();
+    }
+    if (compromised || signal?.aborted || controller.signal.aborted || typeof tokens?.access_token !== "string" || !tokens.access_token ||
+      typeof tokens.expires_in !== "number" || !Number.isFinite(tokens.expires_in) || tokens.expires_in <= 0 ||
+      tokens.refresh_token !== undefined && (typeof tokens.refresh_token !== "string" || !tokens.refresh_token)) throw Error();
+    latest.claudeAiOauth = { ...latest.claudeAiOauth, accessToken: tokens.access_token,
+      refreshToken: tokens.refresh_token ?? current.refreshToken, expiresAt: Date.now() + tokens.expires_in * 1000,
+      refreshTokenExpiresAt: typeof tokens.refresh_token_expires_in === "number" && tokens.refresh_token_expires_in > 0
+        ? Date.now() + tokens.refresh_token_expires_in * 1000 : undefined,
+      ...(typeof tokens.scope === "string" ? { scopes: tokens.scope.split(/\s+/).filter(Boolean) } : {}) };
+    await atomicWrite(join(home, ".credentials.json"), JSON.stringify(latest));
+    return latest.claudeAiOauth;
+  } catch (error) {
+    if (error instanceof QuotaError) throw error;
+    throw new QuotaError("error", "인증을 자동 갱신 중이거나 연결을 확인하지 못했습니다. 잠시 후 다시 조회하세요.", 15000);
+  } finally {
+    clearTimeout(timer); signal?.removeEventListener("abort", abort);
+    for (const release of releases.reverse()) await release().catch(() => {});
+  }
+}
+async function claudeAccount(home: string, fetchApi: typeof fetch, signal?: AbortSignal) {
+  let oauth = (await claudeCredentials(home)).claudeAiOauth;
+  if (typeof oauth?.expiresAt === "number" && oauth.expiresAt <= Date.now() + 120000 && oauth.refreshToken)
+    oauth = await refreshClaude(home, fetchApi, signal);
   if (typeof oauth?.accessToken !== "string" || !oauth.accessToken) throw new QuotaError("unavailable", "이 인증 방식은 구독 한도를 제공하지 않습니다.");
-  const request = async (path: string, body?: object) => {
+  const request = async (path: string, body?: object, retried = false): Promise<any> => {
     const controller = new AbortController(), abort = () => controller.abort();
     const timer = setTimeout(abort, body ? 25000 : 10000);
     signal?.addEventListener("abort", abort, { once: true });
@@ -209,8 +276,15 @@ async function claudeAccount(home: string, fetchApi: typeof fetch, signal?: Abor
         "User-Agent": "claude-cli/2.1.285 (external, cli)", ...(body ? { "Content-Type": "application/json" } : {}) },
       ...(body ? { body: JSON.stringify(body) } : {}),
     }); } catch { throw new QuotaError("error", body ? "Claude 리셋 결과를 확인하지 못했습니다." : "Claude 한도를 조회하지 못했습니다. 연결을 확인하고 새로고침하세요."); }
+    const revoked = response.status === 403 && /OAuth token has been revoked/i.test(await response.clone().text());
+    if ((response.status === 401 || revoked) && !body && !retried) {
+      const previous = oauth.accessToken;
+      oauth = await refreshClaude(home, fetchApi, signal, previous);
+      if (oauth?.accessToken && oauth.accessToken !== previous) return request(path, body, true);
+    }
     if (body && [401, 403, 429].includes(response.status)) return { result: response.status === 429 ? "rate_limited" : "auth_error" };
-    if (response.status === 401 || response.status === 403) throw new QuotaError("auth-required", "한도 조회에 다시 로그인이 필요합니다.");
+    if (response.status === 401 || revoked) throw new QuotaError("auth-required", "인증 자동 갱신으로 복구하지 못했습니다. 이 계정에 다시 로그인하세요.", 300000);
+    if (response.status === 403) throw new QuotaError("error", "Claude 한도 조회 권한을 확인하지 못했습니다. 서비스의 계정·조직 권한을 확인하세요.", 300000);
     if (response.status === 429) {
       const header = response.headers.get("retry-after"), seconds = header === null ? NaN : Number(header);
       const retry = Number.isFinite(seconds) ? seconds * 1000 : Date.parse(header ?? "") - Date.now();
@@ -223,7 +297,7 @@ async function claudeAccount(home: string, fetchApi: typeof fetch, signal?: Abor
   const profile = async () => {
     const data = await request("/api/oauth/profile"), user = data?.account?.uuid, organization = data?.organization?.uuid;
     if (typeof user !== "string" || typeof organization !== "string" || !claudeUuid.test(user) || !claudeUuid.test(organization))
-      throw new QuotaError("auth-required", "Claude 리셋 계정 신원을 확인하지 못했습니다.");
+      throw new QuotaError("error", "Claude 리셋 계정 신원 응답을 확인하지 못했습니다. 다시 조회하세요.");
     return { organization: organization.toLowerCase(), identity: createHash("sha256").update(JSON.stringify(["claude", user, organization])).digest("hex") };
   };
   return { request, profile, plan: oauth.subscriptionType };
@@ -244,6 +318,8 @@ export async function claudeConsumeReset(home: string, attemptId: string, credit
   if (!retry) {
     const credits = parseClaudeResetCredits((await account.request(CLAUDE_USAGE_PATH)).cedar_ember);
     if (credits.credits?.find(credit => credit.id === creditId)?.status !== "available") throw new QuotaError("error", "선택한 Claude 리셋권은 현재 사용할 수 없습니다.");
+    if ((await account.profile()).identity !== expectedIdentity)
+      throw new QuotaError("auth-required", "Claude 로그인 계정이 변경되어 리셋을 중단했습니다.");
   }
   const response = await account.request(`/api/organizations/${profile.organization}/reset_rate_limits`,
     { program: "cedar_ember", grant_id: creditId, request_id: attemptId });
