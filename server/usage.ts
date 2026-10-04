@@ -106,10 +106,10 @@ export function parseCodexQuota(response: any, plan?: unknown): Quota {
     const bucket = raw as any;
     for (const kind of ["primary", "secondary"]) {
       const window = bucket?.[kind], used = percent(window?.usedPercent), duration = window?.windowDurationMins;
-      if (used === null || (duration !== 300 && duration !== 10080)) continue;
+      if (used === null || typeof duration !== "number" || !Number.isFinite(duration) || duration <= 0) continue;
       const suffix = id === "codex" ? "" : ` · ${typeof bucket.limitName === "string" ? bucket.limitName : id}`;
-      windows.push({ id: `${id}:${kind}`, label: (duration === 300 ? "5시간 한도" : "주간 한도") + suffix,
-        usedPercent: used, durationMinutes: duration, resetsAt: date(window.resetsAt, true) });
+      windows.push({ id: `${id}:${kind}`, label: (duration === 300 ? "5시간 한도" : duration === 10080 ? "주간 한도" : `${duration}분 한도`) + suffix,
+        usedPercent: used, durationMinutes: duration, resetsAt: date(window.resetsAt, true), scope: id === "codex" ? null : String(id) });
     }
   }
   const raw = response?.rateLimitResetCredits;
@@ -129,18 +129,18 @@ export function parseCodexQuota(response: any, plan?: unknown): Quota {
 
 export function parseClaudeQuota(response: any, plan?: unknown): Quota {
   const windows: Quota["windows"] = [];
-  const add = (id: string, label: string, value: any, durationMinutes = 10080) => {
+  const add = (id: string, label: string, value: any, durationMinutes = 10080, scope: string | null = null) => {
     const used = percent(value?.utilization ?? value?.percent);
-    if (used !== null) windows.push({ id, label, usedPercent: used, durationMinutes, resetsAt: date(value.resets_at) });
+    if (used !== null) windows.push({ id, label, usedPercent: used, durationMinutes, resetsAt: date(value.resets_at), scope });
   };
   add("five_hour", "5시간 한도", response?.five_hour, 300);
   add("seven_day", "주간 한도", response?.seven_day);
-  for (const model of ["opus", "sonnet"]) add(`seven_day_${model}`, `주간 한도 · ${model === "opus" ? "Opus" : "Sonnet"}`, response?.[`seven_day_${model}`]);
+  for (const model of ["opus", "sonnet"]) add(`seven_day_${model}`, `주간 한도 · ${model === "opus" ? "Opus" : "Sonnet"}`, response?.[`seven_day_${model}`], 10080, model);
   if (Array.isArray(response?.limits)) for (const [i, value] of response.limits.entries()) {
     if (value?.kind !== "weekly_scoped") continue;
     const scope = value.scope?.model ?? value.scope?.surface;
     const name = typeof scope === "string" ? scope : scope?.display_name ?? scope?.id;
-    if (typeof name === "string") add(`scoped:${i}`, `주간 한도 · ${name}`, value);
+    if (typeof name === "string") add(`scoped:${i}`, `주간 한도 · ${name}`, value, 10080, name);
   }
   if (!response || typeof response !== "object") throw new QuotaError("error", "Claude 한도 응답을 읽지 못했습니다.");
   let resetCredits = null, resetError = null;

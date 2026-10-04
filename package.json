@@ -1,7 +1,7 @@
 {
   "name": "multi-harness-accounts",
   "private": true,
-  "version": "1.4.3",
+  "version": "1.5.0",
   "type": "module",
   "files": [
     "paseo-plugin.json",
@@ -11,11 +11,12 @@
     "index.server.tsx",
     "client/",
     "server/",
-    "shared/"
+    "shared/",
+    "host/"
   ],
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "test": "tsc --strict --noEmit false --outDir .test-build --target ES2022 --module NodeNext --moduleResolution NodeNext --types node --skipLibCheck server/manager.ts server/extensions.ts && node --test tests/*.test.mjs",
+    "test": "tsc --strict --noEmit false --outDir .test-build --target ES2022 --module NodeNext --moduleResolution NodeNext --types node --skipLibCheck server/manager.ts server/extensions.ts server/schedules.ts && node --test tests/*.test.mjs",
     "test:native": "node tests/native-smoke.mjs",
     "test:extensions-native": "npm test && node tests/extensions-native-smoke.mjs"
   },

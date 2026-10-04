@@ -66,6 +66,13 @@ export class AccountManager {
   private resetting = new Set<string>();
   private nativeIndex: { fetchedAt: number; accounts: string; sessions: AccountSession[]; warnings: string[] } | null = null;
   private importing = new Set<string>();
+  private exclusiveQueue: Promise<unknown> = Promise.resolve();
+  // ponytail: serialize account mutations with scheduled sends; split by agent if host throughput requires it.
+  exclusive<T>(operation: () => Promise<T>): Promise<T> {
+    const next = this.exclusiveQueue.then(operation);
+    this.exclusiveQueue = next.catch(() => {});
+    return next;
+  }
   private restart: (id: string) => Promise<void>;
   constructor(options: { root?: string; adapters?: Record<Harness, HarnessAdapter>; restart?: (id: string) => Promise<void> } = {}) {
     const daemonHome = resolve(process.env.PASEO_HOME ?? join(homedir(), ".paseo"));

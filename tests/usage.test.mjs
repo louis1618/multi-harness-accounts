@@ -28,9 +28,10 @@ test("quotas distinguish real durations, missing data, multi-bucket and Claude s
       primary: { usedPercent: 10, windowDurationMins: 15 },
       secondary: { usedPercent: 60, windowDurationMins: 10080, resetsAt: 1790800000 },
     }, other: { limitName: "모델별", primary: { usedPercent: 110, windowDurationMins: 300 } } } });
-  assert.equal(value.windows.length, 2);
-  assert.equal(value.windows[0].label, "주간 한도");
-  assert.equal(value.windows[1].usedPercent, 100);
+  assert.equal(value.windows.length, 3);
+  assert.equal(value.windows[0].label, "15분 한도");
+  assert.equal(value.windows[1].label, "주간 한도");
+  assert.equal(value.windows[2].usedPercent, 100);
   assert.equal(parseCodexQuota({ rateLimits: { primary: { windowDurationMins: 300 } } }).windows.length, 0);
   assert.equal(parseCodexQuota({}).windows.length, 0);
   assert.deepEqual(parseCodexQuota({ rateLimitsByLimitId: {
@@ -156,7 +157,7 @@ test("per-turn account attribution survives transfers, deferred switch, duplicat
   assert.equal(snapshot.accounts[1].metrics.statistics.totalTokens, 0);
   assert.equal(snapshot.accounts[1].metrics.isMostRecent, false);
   const persisted = await readFile(join(manager.store.root, "metadata.json"), "utf8");
-  assert.equal(JSON.parse(persisted).version, 2);
+  assert.equal(JSON.parse(persisted).version, 3);
   assert.ok(!persisted.includes("access_token"));
   assert.ok(!JSON.stringify(snapshot).includes("identity"));
 });
@@ -172,7 +173,7 @@ test("version-one migration preserves account selection and rejects raw errors c
   const snapshot = await manager.snapshot(paseo);
   assert.equal(snapshot.defaults.codex, id); assert.equal(snapshot.accounts[0].metrics.statistics.turns, 0);
   const metadata = JSON.parse(await readFile(join(root, "metadata.json"), "utf8"));
-  assert.equal(metadata.version, 2); assert.ok(metadata.usage.startedAt);
+  assert.equal(metadata.version, 3); assert.ok(metadata.usage.startedAt);
   assert.ok(!manager.publicError(Error("access_token secret-token")).includes("secret-token"));
 });
 

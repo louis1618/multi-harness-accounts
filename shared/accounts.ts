@@ -1,5 +1,6 @@
 import { defineRpc } from "@getpaseo/plugin";
 import { z } from "zod";
+import { ScheduleStateSchema } from "./schedules.js";
 
 export const HarnessSchema = z.enum(["codex", "claude"]);
 export type Harness = z.infer<typeof HarnessSchema>;
@@ -34,6 +35,7 @@ export const QuotaSchema = z.object({
   windows: z.array(z.object({
     id: z.string(), label: z.string(), usedPercent: z.number().min(0).max(100),
     durationMinutes: z.number().positive(), resetsAt: z.string().datetime().nullable(),
+    scope: z.string().nullable().optional(),
   }).strict()),
   resetError: z.string().nullable().optional(),
   resetCredits: z.object({
@@ -64,7 +66,8 @@ export type UsageCounter = z.infer<typeof CounterSchema>;
 const RotationSettingsSchema = z.object({ codex: z.boolean(), claude: z.boolean() }).strict().default({ codex: false, claude: false });
 const RotationPhaseSchema = z.enum(["checking", "switching", "sending", "continued", "completed", "stopped", "error"]);
 export const StateSchema = z.object({
-  version: z.literal(2).default(2),
+  version: z.literal(3).default(3),
+  schedules: ScheduleStateSchema,
   accounts: z.array(AccountSchema).default([]),
   defaults: z.object({ codex: AccountIdSchema.nullable(), claude: AccountIdSchema.nullable() })
     .default({ codex: null, claude: null }),

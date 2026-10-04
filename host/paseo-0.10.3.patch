@@ -1,0 +1,277 @@
+diff --git a/packages/client/src/daemon-client.ts b/packages/client/src/daemon-client.ts
+index 46194ad..6d8de40 100644
+--- a/packages/client/src/daemon-client.ts
++++ b/packages/client/src/daemon-client.ts
+@@ -423,6 +423,7 @@ export interface DaemonClientTrace {
+ 
+ export interface SendMessageOptions {
+   messageId?: string;
++  sendGuard?: { lastUserMessageAt: string | null; provider?: string; sessionId?: string };
+   activeTurnBehavior?: ActiveTurnBehavior;
+   images?: Array<{ data: string; mimeType: string }>;
+   attachments?: SendAgentMessageRequest["attachments"];
+@@ -3434,6 +3435,7 @@ export class DaemonClient {
+       text,
+       ...(messageId ? { messageId } : {}),
+       ...(options?.activeTurnBehavior ? { activeTurnBehavior: options.activeTurnBehavior } : {}),
++      ...(options?.sendGuard ? { sendGuard: options.sendGuard } : {}),
+       ...(options?.images ? { images: options.images } : {}),
+       ...(options?.attachments ? { attachments: options.attachments } : {}),
+     });
+diff --git a/packages/plugin/src/server/contracts.ts b/packages/plugin/src/server/contracts.ts
+index c1cf10f..a9ddaa5 100644
+--- a/packages/plugin/src/server/contracts.ts
++++ b/packages/plugin/src/server/contracts.ts
+@@ -27,6 +27,9 @@ export interface PluginSettings<Schema extends ZodType> {
+ }
+ 
+ export interface PluginServerContext extends PluginLifecycleRegistration {
++  /** Daemon-owned API is available before the first RPC, including after restart. */
++  readonly paseo?: PaseoApi;
++  readonly capabilities?: { readonly guardedAgentMessages?: 1 };
+   registerSettings<Schema extends ZodType>(
+     definition: import("../settings.js").SettingsDefinition<Schema>,
+   ): PluginSettings<Schema>;
+diff --git a/packages/protocol/src/messages.ts b/packages/protocol/src/messages.ts
+index db72cd3..974d8e3 100644
+--- a/packages/protocol/src/messages.ts
++++ b/packages/protocol/src/messages.ts
+@@ -1354,6 +1354,8 @@ export const SendAgentMessageRequestSchema = z.object({
+   text: z.string(),
+   messageId: z.string().optional(), // Client-provided ID for deduplication
+   activeTurnBehavior: ActiveTurnBehaviorSchema.optional(),
++  /** COMPAT: only a daemon advertising guardedAgentMessages may receive this field. */
++  sendGuard: z.object({ lastUserMessageAt: z.string().nullable(), provider: z.string().optional(), sessionId: z.string().optional() }).optional(),
+   images: z.array(ImageAttachmentSchema).optional(),
+   attachments: AgentAttachmentsSchema,
+ });
+diff --git a/packages/server/src/server/agent/agent-prompt.test.ts b/packages/server/src/server/agent/agent-prompt.test.ts
+index 08bd66a..ff9e1da 100644
+--- a/packages/server/src/server/agent/agent-prompt.test.ts
++++ b/packages/server/src/server/agent/agent-prompt.test.ts
+@@ -13,6 +13,7 @@ import {
+   isSystemInjectedEnvelope,
+   setupFinishNotification,
+   waitForAgentRunStartWithTimeout,
++  startAgentRun,
+ } from "./agent-prompt.js";
+ import type { AgentManagerEvent, ManagedAgent } from "./agent-manager.js";
+ import type {
+@@ -22,6 +23,32 @@ import type {
+   AgentStreamEvent,
+ } from "./agent-sdk-types.js";
+ 
++test("guarded messages claim an idle run without steering, clearing permissions or replacing work", async () => {
++  const time = "2026-10-04T00:00:00.000Z";
++  const agent = { provider: "codex", persistence: { sessionId: "session" }, lifecycle: "idle", activeForegroundTurnId: null, pendingPermissions: new Map(), inFlightPermissionResponses: new Set(), lastUserMessageAt: new Date(time) };
++  let busy = false;
++  const controller = {
++    getAgent: () => agent, hasInFlightRun: () => busy,
++    streamAgent: vi.fn(() => { busy = true; return (async function* () {})(); }),
++    replaceAgentRun: vi.fn(), steerOrReplaceActiveTurn: vi.fn(), tryRunOutOfBand: vi.fn(), reloadAgentSession: vi.fn(),
++  };
++  const run = () => startAgentRun(controller as unknown as Parameters<typeof startAgentRun>[0], "fixture", "Continue", createTestLogger(), { sendGuard: { lastUserMessageAt: time } });
++  agent.pendingPermissions.set("approval", { id: "approval" });
++  await expect(run()).rejects.toThrow("SCHEDULE_GUARD_BUSY");
++  expect(agent.pendingPermissions.size).toBe(1); expect(controller.streamAgent).not.toHaveBeenCalled();
++  agent.pendingPermissions.clear(); agent.inFlightPermissionResponses.add("approval");
++  await expect(run()).rejects.toThrow("SCHEDULE_GUARD_BUSY"); agent.inFlightPermissionResponses.clear();
++  agent.lastUserMessageAt = new Date("2026-10-04T00:00:01.000Z");
++  await expect(run()).rejects.toThrow("SCHEDULE_GUARD_CHANGED");
++  agent.lastUserMessageAt = new Date(time);
++  await expect(startAgentRun(controller as unknown as Parameters<typeof startAgentRun>[0], "fixture", "Continue", createTestLogger(), { sendGuard: { lastUserMessageAt: time, provider: "claude" } })).rejects.toThrow("SCHEDULE_GUARD_CHANGED");
++  await expect(startAgentRun(controller as unknown as Parameters<typeof startAgentRun>[0], "fixture", "Continue", createTestLogger(), { sendGuard: { lastUserMessageAt: time, sessionId: "changed-session" } })).rejects.toThrow("SCHEDULE_GUARD_CHANGED");
++  await expect(run()).resolves.toEqual({ disposition: "turn_started" });
++  await expect(run()).rejects.toThrow("SCHEDULE_GUARD_BUSY");
++  expect(controller.streamAgent).toHaveBeenCalledTimes(1);
++  expect(controller.replaceAgentRun).not.toHaveBeenCalled(); expect(controller.steerOrReplaceActiveTurn).not.toHaveBeenCalled(); expect(controller.tryRunOutOfBand).not.toHaveBeenCalled();
++});
++
+ interface CapturedLogger {
+   logger: Logger;
+   records: Array<Record<string, unknown>>;
+diff --git a/packages/server/src/server/agent/agent-prompt.ts b/packages/server/src/server/agent/agent-prompt.ts
+index 41e2d52..37cf17d 100644
+--- a/packages/server/src/server/agent/agent-prompt.ts
++++ b/packages/server/src/server/agent/agent-prompt.ts
+@@ -27,6 +27,7 @@ export type AgentRunController = Pick<
+ };
+ 
+ export interface StartAgentRunOptions {
++  sendGuard?: { lastUserMessageAt: string | null; provider?: string; sessionId?: string };
+   replaceRunning?: boolean;
+   activeTurnBehavior?: ActiveTurnBehavior;
+   runOptions?: AgentRunOptions;
+@@ -65,6 +66,17 @@ async function steerOrReplaceActiveRun(
+   return null;
+ }
+ 
++function assertSendGuard(agentManager: AgentRunController, agentId: string, guard: NonNullable<StartAgentRunOptions["sendGuard"]>): void {
++  const agent = agentManager.getAgent(agentId);
++  if (!agent || agent.lifecycle === "closed") throw new Error("SCHEDULE_GUARD_ARCHIVED");
++  if (!["idle", "error"].includes(agent.lifecycle) || agent.activeForegroundTurnId || agentManager.hasInFlightRun(agentId) || agent.pendingPermissions.size || agent.inFlightPermissionResponses.size)
++    throw new Error("SCHEDULE_GUARD_BUSY");
++  if ((agent.lastUserMessageAt?.toISOString() ?? null) !== guard.lastUserMessageAt)
++    throw new Error("SCHEDULE_GUARD_CHANGED");
++  if (guard.provider && agent.provider !== guard.provider || guard.sessionId && agent.persistence?.sessionId !== guard.sessionId)
++    throw new Error("SCHEDULE_GUARD_CHANGED");
++}
++
+ async function startOrReplaceRun(
+   agentManager: AgentRunController,
+   agentId: string,
+@@ -74,6 +86,11 @@ async function startOrReplaceRun(
+   iterator: AsyncGenerator<import("./agent-sdk-types.js").AgentStreamEvent>;
+   replaced: boolean;
+ }> {
++  if (options?.sendGuard) {
++    // No await between this check and streamAgent's synchronous pending-run claim.
++    assertSendGuard(agentManager, agentId, options.sendGuard);
++    return { iterator: agentManager.streamAgent(agentId, prompt, options.runOptions), replaced: false };
++  }
+   const replaced = Boolean(options?.replaceRunning && agentManager.hasInFlightRun(agentId));
+   const iterator = replaced
+     ? await agentManager.replaceAgentRun(agentId, prompt, options?.runOptions)
+@@ -112,7 +129,7 @@ export async function startAgentRun(
+   // Out-of-band commands (e.g. /goal pause) must run WITHOUT canceling an
+   // in-flight turn — replaceAgentRun would interrupt the running turn. The
+   // intercept lives at this layer so it covers every prompt entrypoint.
+-  if (agentManager.tryRunOutOfBand(agentId, prompt, options?.runOptions)) {
++  if (!options?.sendGuard && agentManager.tryRunOutOfBand(agentId, prompt, options?.runOptions)) {
+     return { disposition: "out_of_band" };
+   }
+   try {
+@@ -135,7 +152,7 @@ async function startAgentRunInner(
+   options?: StartAgentRunOptions,
+ ): Promise<{ disposition: PromptDispatchDisposition }> {
+   const snapshot = agentManager.getAgent(agentId);
+-  const steered = await steerOrReplaceActiveRun(agentManager, agentId, prompt, options);
++  const steered = options?.sendGuard ? null : await steerOrReplaceActiveRun(agentManager, agentId, prompt, options);
+   if (steered?.disposition === "steered") {
+     return steered;
+   }
+@@ -222,6 +239,7 @@ export function isSystemInjectedEnvelope(text: string): boolean {
+ }
+ 
+ export interface SendPromptToAgentParams {
++  sendGuard?: { lastUserMessageAt: string | null; provider?: string; sessionId?: string };
+   agentManager: AgentManager;
+   agentStorage: AgentStorage;
+   agentId: string;
+@@ -310,6 +328,7 @@ export async function sendPromptToAgent(
+ 
+   const record = await params.agentStorage.get(params.agentId);
+   if (record?.archivedAt) {
++    if (params.sendGuard) throw new Error("SCHEDULE_GUARD_ARCHIVED");
+     if (!unarchive) {
+       return { disposition: "turn_started" };
+     }
+@@ -331,6 +350,7 @@ export async function sendPromptToAgent(
+     : params.runOptions;
+ 
+   return await startAgentRun(params.agentManager, params.agentId, params.prompt, params.logger, {
++    sendGuard: params.sendGuard,
+     replaceRunning: true,
+     activeTurnBehavior: params.activeTurnBehavior,
+     clearPendingPermissions: params.clearPendingPermissions,
+diff --git a/packages/server/src/server/message-receipts/index.test.ts b/packages/server/src/server/message-receipts/index.test.ts
+index 10c1615..5f387d5 100644
+--- a/packages/server/src/server/message-receipts/index.test.ts
++++ b/packages/server/src/server/message-receipts/index.test.ts
+@@ -75,3 +75,15 @@ test("failed local message preparation does not leave an ambiguous receipt", asy
+   await requests.send(input);
+   expect(sends).toBe(1);
+ });
++
++test("a rejected idle guard can retry the same message ID without leaving an uncertain receipt", async () => {
++  const { requests, directory } = await fixture();
++  let busy = true, deliveries = 0;
++  const input = { agentId: "agent", messageId: "scheduled", request: { sendGuard: { lastUserMessageAt: null } },
++    send: async () => { if (busy) throw new Error("SCHEDULE_GUARD_BUSY"); deliveries++; } };
++  await expect(requests.send(input)).rejects.toThrow("SCHEDULE_GUARD_BUSY");
++  busy = false;
++  await new MessageReceipts(directory).send(input);
++  await new MessageReceipts(directory).send(input);
++  expect(deliveries).toBe(1);
++});
+diff --git a/packages/server/src/server/message-receipts/index.ts b/packages/server/src/server/message-receipts/index.ts
+index 6103160..5a4bd8a 100644
+--- a/packages/server/src/server/message-receipts/index.ts
++++ b/packages/server/src/server/message-receipts/index.ts
+@@ -1,5 +1,5 @@
+ import { createHash } from "node:crypto";
+-import { readFile } from "node:fs/promises";
++import { readFile, unlink } from "node:fs/promises";
+ import path from "node:path";
+ import { z } from "zod";
+ import { writeJsonFileAtomic } from "../atomic-file.js";
+@@ -51,7 +51,13 @@ export class MessageReceipts {
+     await input.prepare?.();
+     const receipt = { fingerprint, agentId: input.agentId };
+     await writeJsonFileAtomic(file, { ...receipt, state: "pending" });
+-    await input.send();
++    try {
++      await input.send();
++    } catch (error) {
++      // These errors occur before provider submission; retrying the same ID is safe.
++      if (error instanceof Error && /^SCHEDULE_GUARD_(BUSY|CHANGED|ARCHIVED)$/.test(error.message)) await unlink(file);
++      throw error;
++    }
+     await writeJsonFileAtomic(file, { ...receipt, state: "completed" });
+   }
+ }
+diff --git a/packages/server/src/server/plugins/plugin-process.ts b/packages/server/src/server/plugins/plugin-process.ts
+index 1cc0f57..1ee3e8c 100644
+--- a/packages/server/src/server/plugins/plugin-process.ts
++++ b/packages/server/src/server/plugins/plugin-process.ts
+@@ -247,6 +247,8 @@ function evaluateBundle(bundle: string): void {
+     throw new Error("Plugin server bundle must default export a function");
+   }
+   const contributedCleanup = setup({
++    paseo: paseo!,
++    capabilities: { guardedAgentMessages: 1 },
+     handle: register,
+     registerProvider,
+     registerSettings,
+diff --git a/packages/server/src/server/session.ts b/packages/server/src/server/session.ts
+index c69033a..76ce676 100644
+--- a/packages/server/src/server/session.ts
++++ b/packages/server/src/server/session.ts
+@@ -8057,7 +8057,7 @@ export class Session {
+           agentId,
+           messageId: msg.messageId,
+           activeTurnBehavior: msg.activeTurnBehavior,
+-          textPrefix: msg.text.slice(0, 80),
++          textPrefix: msg.sendGuard ? undefined : msg.text.slice(0, 80),
+         },
+         "agent.session.send_agent_message",
+       );
+@@ -8069,7 +8069,8 @@ export class Session {
+           prompt,
+           messageId: msg.messageId,
+           activeTurnBehavior: msg.activeTurnBehavior ?? "interrupt",
+-          clearPendingPermissions: true,
++          sendGuard: msg.sendGuard,
++          clearPendingPermissions: !msg.sendGuard,
+           logger: this.sessionLogger,
+         });
+         if (result.disposition === "turn_started") {
+@@ -8084,7 +8085,7 @@ export class Session {
+         await this.messageReceipts.send({
+           agentId,
+           messageId: msg.messageId,
+-          request: { prompt, activeTurnBehavior: msg.activeTurnBehavior ?? "interrupt" },
++          request: { prompt, activeTurnBehavior: msg.activeTurnBehavior ?? "interrupt", ...(msg.sendGuard ? { sendGuard: msg.sendGuard } : {}) },
+           prepare: async () => {
+             await this.prepareAgentMessage(agentId, msg.text);
+           },
+@@ -8105,7 +8106,8 @@ export class Session {
+       });
+     } catch (error) {
+       if (this.delivery.requestSignal.aborted) return;
+-      this.handleAgentRunError(resolved.agentId, error, "Failed to send agent message");
++      if (!(error instanceof Error && error.message.startsWith("SCHEDULE_GUARD_")))
++        this.handleAgentRunError(resolved.agentId, error, "Failed to send agent message");
+       this.emit({
+         type: "send_agent_message_response",
+         payload: {

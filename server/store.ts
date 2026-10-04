@@ -30,7 +30,7 @@ export class Store {
     try {
       const stored = JSON.parse(await readFile(join(this.root, "metadata.json"), "utf8"));
       // Version 1 contains the same account/session metadata and no usage history.
-      if (stored.version === 1) stored.version = 2;
+      if (stored.version === 1 || stored.version === 2) stored.version = 3;
       return StateSchema.parse(stored);
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") return StateSchema.parse({});
