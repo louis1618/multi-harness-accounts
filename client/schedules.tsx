@@ -29,14 +29,13 @@ function ScheduleForm({ agentId, colors, close, onOverview }: { agentId: string;
   const [initialized, setInitialized] = useState(false), [error, setError] = useState<string | null>(null), [now, setNow] = useState(Date.now());
   const pending = query.data?.jobs.find(j => j.status === "waiting" || j.status === "sending") ?? query.data?.jobs.find(j => j.status === "attention");
   useEffect(() => {
-    if (initialized || !query.data) return;
+    if (initialized || !query.data || !pending && (query.isFetching || query.data.resetReason === "초기화 시각 조회 중…")) return;
     const at = pending?.dueAt ?? query.data.defaultAt;
     if (at) { const parts = localDateTime(at); setDate(parts.date); setTime(parts.time); }
     else setDate(localDateTime(new Date().toISOString()).date);
     if (pending) setMessage(pending.message);
-    // Wait for the first native quota response before accepting an empty default.
-    if (at || query.data.resetReason !== "초기화 시각 조회 중…") setInitialized(true);
-  }, [query.data, initialized, pending]);
+    setInitialized(true);
+  }, [query.data, query.isFetching, initialized, pending]);
   useEffect(() => { const timer = setInterval(() => setNow(Date.now()), 1000); return () => clearInterval(timer); }, []);
   const dueAt = parseLocalDateTime(date, time), supported = query.data?.supported ?? false;
   const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
@@ -45,6 +44,7 @@ function ScheduleForm({ agentId, colors, close, onOverview }: { agentId: string;
     <View style={{ gap: 5 }}>
       <Text accessibilityRole="header" style={{ fontSize: 20, fontWeight: "600", color: colors.foreground }}>메시지 예약</Text>
       <Text style={{ color: colors.foregroundMuted, fontSize: 14, lineHeight: 21 }}>지정한 시각 이후, 현재 작업이 끝나면 전송합니다.</Text>
+      {query.data?.context && <Text style={{ color: colors.foregroundMuted, fontSize: 14 }}>{harnessLabels[query.data.context.harness]} · {query.data.context.accountLabel}</Text>}
     </View>
     {query.isPending && <ActivityIndicator color={colors.accent} accessibilityLabel="예약 정보 조회 중" />}
     {query.isError && <Text accessibilityRole="alert" style={{ color: colors.statusDanger }}>{publicError(query.error)}</Text>}
@@ -69,9 +69,9 @@ function ScheduleForm({ agentId, colors, close, onOverview }: { agentId: string;
     <View style={{ gap: 5 }}>
       <Text style={{ color: colors.foregroundMuted, fontSize: 13 }}>기기 시간대 · {timezone}</Text>
       <Text accessibilityLiveRegion="polite" style={{ color: colors.foregroundMuted, fontSize: 14 }}>{dueAt ? formatResetCountdown(dueAt, now) : query.data?.resetReason ?? "초기화 시각 조회 중…"}</Text>
-      {query.data?.defaultAt && <Pressable accessibilityRole="button" accessibilityLabel="계정의 초기화 시각으로 설정" style={{ minHeight: 44, justifyContent: "center" }}
+      {query.data?.defaultAt && <Pressable accessibilityRole="button" accessibilityLabel="5시간·주간 한도 중 가장 빠른 초기화 시각으로 설정" style={{ minHeight: 44, justifyContent: "center" }}
         onPress={() => { const parts = localDateTime(query.data!.defaultAt!); setDate(parts.date); setTime(parts.time); setInitialized(true); }}>
-        <Text style={{ color: colors.accent, fontSize: 14 }}>초기화 시각 사용 · {dateLabel(query.data.defaultAt)}</Text>
+        <Text style={{ color: colors.accent, fontSize: 14 }}>가장 빠른 초기화 · {dateLabel(query.data.defaultAt)}</Text>
       </Pressable>}
       {query.data?.error && <Text style={{ color: colors.foregroundMuted, lineHeight: 21 }}>{query.data.error}</Text>}
     </View>
@@ -100,7 +100,7 @@ export function scheduleUI(client: PluginClientContext) {
   function Composer(props: PluginButtonContentProps) {
     if (props.context !== "agent") return null;
     return <ScrollView keyboardShouldPersistTaps="handled" contentContainerStyle={{ padding: 20 }}>
-      <ScheduleForm agentId={props.agentId} colors={props.theme.colors} close={props.close} onOverview={() => { props.close(); open(); }} />
+      <ScheduleForm key={props.agentId} agentId={props.agentId} colors={props.theme.colors} close={props.close} onOverview={() => { props.close(); open(); }} />
     </ScrollView>;
   }
   function Timeline(props: PluginTimelineItemProps<ScheduleCard>) {

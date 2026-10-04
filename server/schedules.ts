@@ -13,11 +13,11 @@ export function resetFor(quota: Quota, model: string | null, now: number) {
   const windows = quota.windows.filter(w => !w.scope || !model || model.toLowerCase().includes(w.scope.toLowerCase()) ||
     !/opus|sonnet|haiku|gpt|review|spark|image/i.test(w.scope));
   const blocked = windows.filter(w => w.usedPercent >= 100);
-  const future = (blocked.length ? blocked : windows).filter(w => w.resetsAt && Date.parse(w.resetsAt) > now);
-  const missing = blocked.some(w => !w.resetsAt || Date.parse(w.resetsAt) <= now);
-  const at = !missing && future.length ? new Date((blocked.length ? Math.max : Math.min)(...future.map(w => Date.parse(w.resetsAt!)))).toISOString() : null;
+  const next = windows.filter(w => (w.durationMinutes === 300 || w.durationMinutes === 10080) && w.resetsAt && Date.parse(w.resetsAt) > now)
+    .sort((a, b) => Date.parse(a.resetsAt!) - Date.parse(b.resetsAt!))[0];
+  const at = next?.resetsAt ?? null;
   return { blocked: blocked.length > 0, stale: blocked.length > 0 && blocked.every(w => w.resetsAt && Date.parse(w.resetsAt) <= now), at,
-    reason: blocked.length ? `초기화 대기 · ${blocked.map(w => w.label).join(" · ")}` : at ? "현재 계정의 다음 한도 초기화" : "초기화 시각이 제공되지 않습니다. 시간을 직접 지정하세요." };
+    reason: next ? `가장 빠른 초기화 · ${next.label}` : "5시간·주간 한도의 초기화 시각이 제공되지 않습니다. 시간을 직접 지정하세요." };
 }
 function modelOf(agent: Agent): string | null {
   const value = Reflect.get(agent, "model") ?? Reflect.get(agent, "modelId");
@@ -47,7 +47,8 @@ export class ScheduleManager {
     });
     if (!snapshot || snapshot.agent.archivedAt) throw new AccountError("세션이 보관되었거나 삭제되었습니다.");
     const agent = snapshot.agent, harness = HarnessSchema.parse(agent.provider), state = await this.accounts.store.read();
-    const binding = state.bindings[id], accountId = binding?.accountId ?? selectedAccount(state, harness, id);
+    const savedBinding = state.bindings[id], binding = savedBinding?.harness === harness ? savedBinding : undefined;
+    const accountId = binding ? binding.accountId : selectedAccount(state, harness, id);
     const account = accountId ? state.accounts.find(a => a.id === accountId && a.harness === harness) : null;
     if (accountId && !account) throw new AccountError("예약에 사용할 계정을 찾지 못했습니다.");
     const adapter = this.accounts.adapters[harness], home = binding?.home ?? (account ? this.accounts.profile(account) : adapter.systemHome);
@@ -56,14 +57,17 @@ export class ScheduleManager {
   async list(agentId?: string) {
     const state = await this.accounts.store.read();
     let defaultAt: string | null = null, resetReason: string | null = null, error: string | null = null;
+    let context: { harness: "codex" | "claude"; accountLabel: string } | null = null;
     if (agentId && this.paseo) try {
-      const c = await this.context(agentId), quota = this.quotas.get(`${c.home}:${c.binding?.identity ?? ""}`, signal => c.adapter.quota(c.home, c.accountId === null, signal));
+      const c = await this.context(agentId);
+      context = { harness: c.harness, accountLabel: c.accountLabel };
+      const quota = this.quotas.get(`${c.harness}:${c.accountId ?? "system"}:${c.home}:${c.binding?.identity ?? ""}`, signal => c.adapter.quota(c.home, c.accountId === null, signal));
       const reset = resetFor(quota, modelOf(c.agent), this.now()); defaultAt = reset.at; resetReason = quota.status === "loading" ? "초기화 시각 조회 중…" : reset.reason;
       if (quota.status === "error" || quota.status === "auth-required") error = "한도를 조회하지 못했습니다. 인증·연결을 확인하거나 시간을 직접 지정하세요.";
     } catch { error = "초기화 시각을 조회하지 못했습니다. 시간을 직접 지정하거나 잠시 후 다시 시도하세요."; }
     return { supported: this.supported, jobs: Object.values(state.schedules.jobs).filter(j => !agentId || j.agentId === agentId)
       .sort((a, b) => Number(activeSchedule(b)) - Number(activeSchedule(a)) || (activeSchedule(a) ? a.dueAt.localeCompare(b.dueAt) : b.updatedAt.localeCompare(a.updatedAt))).map(scheduleCard),
-      automatic: agentId ? state.schedules.automatic[agentId] ?? false : false, defaultAt, resetReason,
+      automatic: agentId ? state.schedules.automatic[agentId] ?? false : false, defaultAt, resetReason, context,
       timezone: Intl.DateTimeFormat().resolvedOptions().timeZone, error };
   }
   async change(input: { action: "save"; agentId: string; message: string; dueAt: string } | { action: "cancel"; id: string } | { action: "automatic"; agentId: string; enabled: boolean }) {

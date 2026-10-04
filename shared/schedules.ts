@@ -34,6 +34,7 @@ export const scheduleCard = (job: Schedule): ScheduleCard => ScheduleCardSchema.
 const AgentId = z.string().min(1).max(128).regex(/^[A-Za-z0-9_-]+$/);
 export const listSchedules = defineRpc({ name: "accounts.schedules.list", input: z.object({ agentId: AgentId.optional() }).strict(),
   output: z.object({ supported: z.boolean(), jobs: z.array(ScheduleCardSchema), automatic: z.boolean(),
+    context: z.object({ harness: ScheduleCardSchema.shape.harness, accountLabel: z.string() }).strict().nullable().default(null),
     defaultAt: z.string().datetime().nullable(), resetReason: z.string().nullable(), timezone: z.string(), error: z.string().nullable() }).strict() });
 export const changeSchedule = defineRpc({ name: "accounts.schedules.change", input: z.discriminatedUnion("action", [
   z.object({ action: z.literal("save"), agentId: AgentId, message: ScheduleCardSchema.shape.message, dueAt: z.string().datetime() }).strict(),

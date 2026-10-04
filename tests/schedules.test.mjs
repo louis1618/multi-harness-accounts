@@ -56,14 +56,64 @@ test('time input round-trips locally and rejects overflow dates and malformed RP
   assert.equal(parseLocalDateTime('2026-10-04', '24:10'), null);
   assert.throws(() => changeSchedule.input.parse({ action: 'save', agentId: 'fixture-agent', message: '', dueAt: iso }));
 });
-test('uses latest blocking reset, includes actual durations, and excludes unrelated model limits', () => {
+test('uses the earliest provided five-hour or weekly reset regardless of exhaustion', () => {
   const q = parseClaudeQuota({ five_hour: { utilization: 100, resets_at: new Date(NOW + 1000).toISOString() },
     seven_day: { utilization: 100, resets_at: new Date(NOW + 2000).toISOString() },
     seven_day_opus: { utilization: 100, resets_at: new Date(NOW + 99999).toISOString() } });
-  assert.equal(resetFor(q, 'claude-sonnet-4', NOW).at, new Date(NOW + 2000).toISOString());
-  q.windows[0].resetsAt = null; assert.equal(resetFor(q, 'claude-sonnet-4', NOW).at, null);
+  assert.equal(resetFor(q, 'claude-sonnet-4', NOW).at, new Date(NOW + 1000).toISOString());
+  q.windows[0].usedPercent = 20; assert.equal(resetFor(q, 'claude-sonnet-4', NOW).at, new Date(NOW + 1000).toISOString());
+  q.windows[1].resetsAt = new Date(NOW + 500).toISOString(); assert.equal(resetFor(q, 'claude-sonnet-4', NOW).at, new Date(NOW + 500).toISOString());
+  q.windows[0].resetsAt = null; assert.equal(resetFor(q, 'claude-sonnet-4', NOW).at, new Date(NOW + 500).toISOString());
+  q.windows[1].resetsAt = new Date(NOW).toISOString(); assert.equal(resetFor(q, 'claude-sonnet-4', NOW).at, null);
   const other = parseCodexQuota({ rateLimits: { primary: { usedPercent: 100, windowDurationMins: 60, resetsAt: (NOW + 1000) / 1000 } } });
-  assert.equal(other.windows[0].durationMinutes, 60); assert.equal(resetFor(other, 'gpt-6', NOW).at, new Date(NOW + 1000).toISOString());
+  assert.equal(other.windows[0].durationMinutes, 60); assert.equal(resetFor(other, 'gpt-6', NOW).at, null);
+  const codex = parseCodexQuota({ rateLimits: { primary: { usedPercent: 10, windowDurationMins: 300, resetsAt: (NOW + 1000) / 1000 },
+    secondary: { usedPercent: 100, windowDurationMins: 10080, resetsAt: (NOW + 2000) / 1000 } } });
+  assert.equal(resetFor(codex, 'gpt-6', NOW).at, new Date(NOW + 1000).toISOString());
+  assert.equal(resetFor(codex, 'gpt-6', NOW).blocked, true);
+});
+test('each session uses its own harness adapter and running account, with separate quota caches', async t => {
+  const f = await fixture(t), calls = [], claude = { ...f.agent, id: 'claude-session', provider: 'claude', model: 'claude-sonnet-4' };
+  const claudeAccount = { ...f.account, id: randomUUID(), harness: 'claude', label: 'Claude B' };
+  const otherCodex = { ...f.account, id: randomUUID(), label: 'Different default' };
+  await f.manager.store.update(s => {
+    s.accounts.push(claudeAccount, otherCodex); s.defaults.codex = otherCodex.id; s.defaults.claude = claudeAccount.id;
+    s.bindings[claude.id] = { ...s.bindings[f.agent.id], harness: 'claude', accountId: claudeAccount.id };
+  });
+  const ref = f.paseo.agents.ref;
+  f.paseo.agents.ref = id => id === claude.id ? { ...ref(id), refresh: async () => ({ agent: claude }) } : ref(id);
+  f.manager.adapters.codex = { ...f.manager.adapters.codex, quota: async (home, native) => { calls.push(['codex', home, native]); return quota(100, NOW + 1000); } };
+  f.manager.adapters.claude = { ...f.manager.adapters.claude, quota: async (home, native) => { calls.push(['claude', home, native]); return parseClaudeQuota({ five_hour: { utilization: 100, resets_at: new Date(NOW + 2000).toISOString() } }); } };
+  await f.scheduler.list(f.agent.id); await f.scheduler.list(claude.id); await new Promise(setImmediate);
+  const a = await f.scheduler.list(f.agent.id), b = await f.scheduler.list(claude.id);
+  assert.equal(a.defaultAt, new Date(NOW + 1000).toISOString()); assert.equal(b.defaultAt, new Date(NOW + 2000).toISOString());
+  assert.deepEqual(a.context, { harness: 'codex', accountLabel: 'A' }); assert.deepEqual(b.context, { harness: 'claude', accountLabel: 'Claude B' });
+  assert.deepEqual(calls, [['codex', f.root, false], ['claude', f.root, false]]);
+});
+test('a running system account stays native even when a different global default is selected', async t => {
+  const f = await fixture(t), calls = [], systemHome = join(f.root, 'system');
+  await f.manager.store.update(s => { s.bindings[f.agent.id].accountId = null; s.bindings[f.agent.id].home = systemHome; });
+  f.manager.adapters.codex = { ...f.manager.adapters.codex, systemHome, quota: async (home, native) => { calls.push([home, native]); return quota(10, NOW + 1000); } };
+  await f.scheduler.list(f.agent.id); await new Promise(setImmediate); const result = await f.scheduler.list(f.agent.id);
+  assert.deepEqual(result.context, { harness: 'codex', accountLabel: '시스템 계정' });
+  assert.deepEqual(calls, [[systemHome, true]]); assert.equal(result.defaultAt, new Date(NOW + 1000).toISOString());
+});
+test('a changed harness does not reuse the previous harness profile directory', async t => {
+  const f = await fixture(t), calls = [], account = { ...f.account, id: randomUUID(), harness: 'claude', label: 'Claude B' };
+  f.agent.provider = 'claude'; f.agent.model = 'claude-sonnet-4';
+  await f.manager.store.update(s => { s.accounts.push(account); s.defaults.claude = account.id; });
+  f.manager.adapters.claude = { ...f.manager.adapters.claude, quota: async (home, native) => { calls.push([home, native]); return quota(0, NOW + 2000); } };
+  await f.scheduler.list(f.agent.id); await new Promise(setImmediate); const result = await f.scheduler.list(f.agent.id);
+  assert.deepEqual(result.context, { harness: 'claude', accountLabel: 'Claude B' });
+  assert.deepEqual(calls, [[f.manager.profile(account), false]]); assert.equal(result.defaultAt, new Date(NOW + 2000).toISOString());
+});
+test('the earliest reset never submits while the other applicable limit is still exhausted', async t => {
+  const f = await fixture(t), weekly = new Date(NOW + 2000).toISOString();
+  f.setQuota(parseCodexQuota({ rateLimits: { primary: { usedPercent: 0, windowDurationMins: 300, resetsAt: (NOW + 1000) / 1000 },
+    secondary: { usedPercent: 100, windowDurationMins: 10080, resetsAt: (NOW + 2000) / 1000 } } }));
+  await f.reserve(); f.advance(1000); await f.tick();
+  assert.equal(f.sent.length, 0); assert.equal((await f.jobs())[0].dueAt, weekly);
+  f.setQuota(quota(0)); f.advance(1000); await f.tick(); assert.equal(f.sent.length, 1);
 });
 test('persists one pending message, immediately renders the card, edits it, and sends exactly once', async t => {
   const f = await fixture(t); await f.reserve('finish the requested work');
