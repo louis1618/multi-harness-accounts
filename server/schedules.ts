@@ -35,7 +35,7 @@ export class ScheduleManager {
   constructor(readonly accounts: AccountManager, private now: () => number = Date.now) {}
   start(paseo: PaseoApi, supported: boolean) {
     this.paseo = paseo; this.supported = supported;
-    if (supported) void this.kick();
+    return supported ? this.restoreAutomatic().catch(() => {}).finally(() => { void this.kick(); }) : Promise.resolve();
   }
   connect(paseo: PaseoApi) { this.paseo ??= paseo; }
   private iso() { return new Date(this.now()).toISOString(); }
@@ -80,8 +80,12 @@ export class ScheduleManager {
       if (!this.supported) throw new AccountError("안전한 예약 전송을 위해 Paseo 호스트 업데이트가 필요합니다.");
       if (input.action === "automatic") {
         await this.context(input.agentId);
-        await this.accounts.store.update(s => { s.schedules.automatic[input.agentId] = input.enabled; });
+        await this.accounts.store.update(s => {
+          if (input.enabled && !s.schedules.automatic[input.agentId]) delete s.schedules.lastFailures[input.agentId];
+          s.schedules.automatic[input.agentId] = input.enabled;
+        });
         if (!input.enabled) await this.cancelAgent(input.agentId, "자동 재개를 껐습니다.", true);
+        else await this.recoverAutomatic(input.agentId);
       } else {
         if (Date.parse(input.dueAt) <= this.now()) throw new AccountError("현재 시각 이후로 예약하세요.");
         await this.save(input.agentId, input.message, input.dueAt, "manual");
@@ -89,8 +93,11 @@ export class ScheduleManager {
     }
     void this.kick(); return { message: input.action === "cancel" ? "예약을 취소했습니다." : input.action === "automatic" ? "자동 재개 설정을 저장했습니다." : "메시지를 예약했습니다." };
   }
-  private async save(id: string, message: string, dueAt: string, source: Schedule["source"], attention?: string) {
-    const c = await this.context(id), auth = await c.adapter.status(c.home, c.accountId === null).catch(error => {
+  private async save(id: string, message: string, dueAt: string, source: Schedule["source"], attention?: string, expectedLastUserAt?: string | null) {
+    const c = await this.context(id);
+    if (source === "automatic" && expectedLastUserAt !== undefined && (c.agent.lastUserMessageAt !== expectedLastUserAt ||
+      c.agent.activeTurn || !["idle", "error"].includes(c.agent.status))) return;
+    const auth = await c.adapter.status(c.home, c.accountId === null).catch(error => {
       if (source === "manual") throw error;
       return { signedIn: false, identity: c.binding?.identity ?? null };
     });
@@ -157,6 +164,26 @@ export class ScheduleManager {
       if (job.agentId === id && job.status === "waiting" && job.waitingFor) job.nextAttemptAt = null; });
     void this.kick();
   }
+  private async restoreAutomatic() {
+    const state = await this.accounts.store.read();
+    for (const [id, enabled] of Object.entries(state.schedules.automatic)) if (enabled && !this.disposed)
+      await this.recoverAutomatic(id).catch(() => {});
+  }
+  private async recoverAutomatic(id: string) {
+    const c = await this.context(id);
+    if (this.disposed || !c.state.schedules.automatic[id] || c.agent.activeTurn || !["idle", "error"].includes(c.agent.status) ||
+      Object.values(c.state.schedules.jobs).some(j => j.agentId === id && (activeSchedule(j) || j.status === "attention"))) return;
+    const endedAt = Date.parse(c.agent.attentionTimestamp ?? c.agent.updatedAt ?? c.agent.lastUserMessageAt ?? "");
+    if (!Number.isFinite(endedAt) || this.now() - endedAt > DAY) return;
+    const page = await this.paseo!.agents.ref(id).timeline.refetch({ direction: "tail", projection: "canonical", limit: 100 });
+    const recent = [...page.entries].reverse();
+    const last = recent.find(e => e.item.type === "assistant_message" || e.item.type === "user_message");
+    if (!last || last.item.type !== "assistant_message") return;
+    const current = await this.context(id);
+    if (this.disposed || current.agent.lastUserMessageAt !== c.agent.lastUserMessageAt || current.agent.activeTurn) return;
+    // Inspect only the latest reply: a newer request or a successful reply supersedes an old quota error.
+    await this.turnEnded(id, { outcome: { kind: "completed" }, timeline: [last.item] }, null);
+  }
   async turnEnded(id: string, event: Parameters<typeof isUsageLimitFailure>[0], turnId: string | null) {
     await this.wakeAgent(id);
     if (!this.supported || !this.paseo || !isUsageLimitFailure(event)) { void this.kick(); return; }
@@ -169,7 +196,7 @@ export class ScheduleManager {
     });
     if (!first) return;
     const previous = Object.values(state.schedules.jobs).find(j => j.agentId === id && activeSchedule(j));
-    if (previous?.source === "manual") return;
+    if (previous?.source === "manual" && previous.status === "waiting") return;
     if (previous?.status === "sending") {
       const c = await this.context(id);
       await this.accounts.store.update(s => { const j = s.schedules.jobs[previous.id]; j.retryAfterSend = true; j.retryUserMessageAt = c.agent.lastUserMessageAt; });
@@ -182,8 +209,8 @@ export class ScheduleManager {
     try {
       const c = await this.context(id), quota = await c.adapter.quota(c.home, c.accountId === null), reset = resetFor(quota, modelOf(c.agent), this.now());
       if (confirmQuota && !reset.blocked) return;
-      if (reset.at) await this.save(id, "Continue", reset.at, "automatic");
-      else await this.save(id, "Continue", this.iso(), "automatic", "초기화 시각을 확인하지 못했습니다. 실행 시간을 직접 지정하세요.");
+      if (reset.at) await this.save(id, "Continue", reset.at, "automatic", undefined, c.agent.lastUserMessageAt);
+      else await this.save(id, "Continue", this.iso(), "automatic", "초기화 시각을 확인하지 못했습니다. 실행 시간을 직접 지정하세요.", c.agent.lastUserMessageAt);
     } catch {
       await this.save(id, "Continue", this.iso(), "automatic", "계정·사용량을 조회하지 못했습니다. 상태를 확인하고 예약 시간을 직접 지정하세요.").catch(() => {});
     }

@@ -16,10 +16,10 @@ const execute = promisify(execFile);
 type TurnEnd = Pick<PluginLifecycleEvents["agent.turn_ended"], "outcome" | "timeline">;
 export function isUsageLimitFailure(event: TurnEnd): boolean {
   if (event.outcome.kind === "canceled") return false;
-  const explicit = /usage_limit_reached|insufficient_quota|quota_exceeded|(?:usage|subscription|weekly|5.hour) (?:usage )?limit[^\n]{0,80}(?:reached|exceeded|exhausted)|you(?:['’]ve| have) (?:hit|reached) your (?:usage )?limit|사용량.{0,12}(?:소진|한도.{0,8}도달)/i;
+  const explicit = /usage_limit_reached|insufficient_quota|quota_exceeded|(?:usage|session|subscription|weekly|5.hour) (?:usage )?limit[^\n]{0,80}(?:reached|exceeded|exhausted)|you(?:['’]ve| have) (?:hit|reached) your (?:(?:usage|session|weekly|subscription|5.hour) )?limit|you(?:['’]re| are) out of (?:extra )?usage|사용량.{0,12}(?:소진|한도.{0,8}도달)/i;
   if (event.outcome.kind === "failed") return explicit.test(`${event.outcome.error.code ?? ""} ${event.outcome.error.message}`);
   const last = [...event.timeline].reverse().find(item => item.type === "assistant_message");
-  return last?.type === "assistant_message" && /^(?:you(?:['’]ve| have) (?:hit|reached) your (?:usage )?limit|(?:5.hour|weekly|usage) limit[^\n]{0,60}reached)/i.test(last.text.trim());
+  return last?.type === "assistant_message" && /^(?:you(?:['’]ve| have) (?:hit|reached) your (?:(?:usage|session|weekly|subscription|5.hour) )?limit|you(?:['’]re| are) out of (?:extra )?usage|(?:5.hour|weekly|session|usage) limit[^\n]{0,60}reached)/i.test(last.text.trim());
 }
 const RESUME_PROMPT = "사용량 한도로 중단된 이전 요청의 작업을 이어서 진행해 주세요. 이전 대화와 현재 파일 상태를 확인하고, 이미 완료한 변경이나 외부 작업을 반복하지 말고 미완료 부분부터 계속해 주세요.";
 const owns = (object: object, key: string) => Object.hasOwn(object, key);

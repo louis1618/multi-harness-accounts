@@ -4,7 +4,7 @@ import { mkdtemp, rm, writeFile, readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { AccountManager } from '../.test-build/server/manager.js';
+import { AccountManager, isUsageLimitFailure } from '../.test-build/server/manager.js';
 import { ScheduleManager, resetFor } from '../.test-build/server/schedules.js';
 import { parseCodexQuota, parseClaudeQuota, QuotaError } from '../.test-build/server/usage.js';
 import { emptyTokens } from '../.test-build/shared/accounts.js';
@@ -15,7 +15,7 @@ const failure = { outcome: { kind: 'failed', error: { code: 'usage_limit_reached
 const quota = (used, resets = NOW + 3600000) => parseCodexQuota({ rateLimits: { primary: { usedPercent: used, windowDurationMins: 300, resetsAt: resets / 1000 } } });
 async function fixture(t, harness = 'codex') {
   const root = await mkdtemp(join(tmpdir(), 'paseo-schedule-')); t.after(() => rm(root, { recursive: true, force: true }));
-  let clock = NOW, q = quota(0), signedIn = true, identity = 'identity-A', sendHook;
+  let clock = NOW, q = quota(0), signedIn = true, identity = 'identity-A', sendHook, history = [];
   const account = { id: randomUUID(), harness, label: 'A', createdAt: new Date(NOW).toISOString() };
   const adapter = { systemHome: root, status: async () => ({ signedIn, identity, email: 'fixture@example.test' }), quota: async () => { if (q instanceof Error) throw q; return typeof q === 'function' ? q() : q; } };
   const manager = new AccountManager({ root, adapters: { codex: adapter, claude: adapter } }); t.after(() => manager.dispose());
@@ -29,26 +29,34 @@ async function fixture(t, harness = 'codex') {
   const handle = {
     refresh: async () => ({ agent }), subscribe: () => () => {},
     timeline: { append: async row => { cards.set(row.id, row.data); return { seq: 1, epoch: 'fixture' }; },
-      refetch: async () => ({ entries: [...receipts].map(([id, text]) => ({ item: { type: 'user_message', clientMessageId: id, text } })) }) },
+      refetch: async () => ({ entries: [...[...receipts].map(([id, text]) => ({ item: { type: 'user_message', clientMessageId: id, text } })), ...history.map(item => ({ item }))] }) },
     send: async (text, options) => {
       calls.push(options);
-      if (sendHook) await sendHook(text, options);
       if (receipts.has(options.messageId)) return;
       assert.equal(agent.activeTurn, null); assert.equal(agent.pendingPermissions.length, 0);
       assert.equal(options.sendGuard.lastUserMessageAt, agent.lastUserMessageAt);
       assert.equal(options.sendGuard.provider, agent.provider); assert.equal(options.sendGuard.sessionId, agent.persistence.sessionId);
+      if (sendHook) await sendHook(text, options);
       receipts.set(options.messageId, text); sent.push(text); agent.lastUserMessageAt = new Date(clock).toISOString();
     },
   };
   const paseo = { agents: { ref: () => handle } };
-  const scheduler = new ScheduleManager(manager, () => clock); scheduler.start(paseo, true); t.after(() => scheduler.dispose());
+  const scheduler = new ScheduleManager(manager, () => clock); await scheduler.start(paseo, true); t.after(() => scheduler.dispose());
   const tick = async () => { await scheduler.kick(); await scheduler.kick(); };
   const jobs = async () => Object.values((await manager.store.read()).schedules.jobs);
   const reserve = (message = 'Continue', delay = 1000) => scheduler.change({ action: 'save', agentId: agent.id, message, dueAt: new Date(clock + delay).toISOString() });
   await tick();
   return { root, manager, scheduler, paseo, agent, account, sent, cards, receipts, calls, tick, jobs, reserve,
-    advance: value => { clock += value; }, setQuota: value => { q = value; }, setAuth: (signed, who = identity) => { signedIn = signed; identity = who; }, setSend: value => { sendHook = value; }, now: () => clock };
+    advance: value => { clock += value; }, setQuota: value => { q = value; }, setHistory: value => { history = value; }, setAuth: (signed, who = identity) => { signedIn = signed; identity = who; }, setSend: value => { sendHook = value; }, now: () => clock };
 }
+test('recognizes native Claude session-limit notices while excluding temporary request rate limits', () => {
+  for (const text of ["You've hit your session limit · resets 6:10am (Asia/Seoul)", 'You’ve hit your weekly limit', "You're out of extra usage", "You've hit your 5-hour limit"]) {
+    assert.equal(isUsageLimitFailure({ outcome: { kind: 'completed' }, timeline: [{ type: 'assistant_message', text }] }), true);
+    assert.equal(isUsageLimitFailure({ outcome: { kind: 'failed', error: { code: 'rate_limit', message: text } }, timeline: [] }), true);
+  }
+  assert.equal(isUsageLimitFailure({ outcome: { kind: 'failed', error: { code: 'rate_limit', message: 'Too many requests. Try again in 5 seconds.' } }, timeline: [] }), false);
+  assert.equal(isUsageLimitFailure({ outcome: { kind: 'completed' }, timeline: [{ type: 'assistant_message', text: "The logs contain: You've hit your session limit" }] }), false);
+});
 test('time input round-trips locally and rejects overflow dates and malformed RPC input', () => {
   const iso = new Date(NOW).toISOString(), parts = localDateTime(iso);
   assert.equal(parseLocalDateTime(parts.date, parts.time), iso);
@@ -179,6 +187,58 @@ test('automatic resume is opt-in and rotation takes precedence', async t => {
     fromAccountId: g.account.id, targetAccountId: g.account.id, originalOverride: 'inherit', triedRows: [], triedIdentities: [], messageId: randomUUID(),
     lastUserMessageAt: g.agent.lastUserMessageAt, updatedAt: new Date(NOW).toISOString(), message: 'Fixture' }; });
   await g.scheduler.turnEnded(g.agent.id, failure, 'rotation'); assert.equal((await g.jobs()).length, 0);
+});
+test('native Claude completed session-limit replies create a reset reservation and resume exactly once', async t => {
+  const f = await fixture(t, 'claude'); f.setQuota(quota(100, NOW + 60000));
+  await f.scheduler.change({ action: 'automatic', agentId: f.agent.id, enabled: true });
+  await f.scheduler.turnEnded(f.agent.id, { outcome: { kind: 'completed' }, timeline: [{ type: 'assistant_message', text: "You've hit your session limit · resets 6:10am (Asia/Seoul)" }] }, 'native-session-limit');
+  const [job] = await f.jobs(); assert.equal(job.source, 'automatic'); assert.equal(job.dueAt, new Date(NOW + 60000).toISOString());
+  f.advance(59999); await f.tick(); assert.equal(f.sent.length, 0);
+  f.setQuota(quota(0)); f.advance(1); await f.tick(); await f.tick(); assert.deepEqual(f.sent, ['Continue']);
+});
+test('enabling automatic resume after a quota interruption checks the current reply immediately', async t => {
+  const f = await fixture(t, 'claude'); f.setQuota(quota(100));
+  f.setHistory([{ type: 'user_message', text: 'Finish my work' }, { type: 'assistant_message', text: "You've hit your session limit · resets 6:10am" }]);
+  await f.scheduler.change({ action: 'automatic', agentId: f.agent.id, enabled: true });
+  assert.equal((await f.jobs())[0].source, 'automatic'); assert.equal(f.sent.length, 0);
+});
+test('restart recovers a previously unrecognized interrupted session without replaying successful work', async t => {
+  const f = await fixture(t, 'claude'); f.setQuota(quota(100));
+  await f.manager.store.update(s => { s.schedules.automatic[f.agent.id] = true; });
+  f.setHistory([{ type: 'assistant_message', text: "You've hit your session limit · resets 6:10am" }]);
+  f.scheduler.dispose(); const restored = new ScheduleManager(f.manager, f.now); t.after(() => restored.dispose());
+  await restored.start(f.paseo, true);
+  assert.equal((await f.jobs()).length, 1); assert.equal(f.sent.length, 0);
+});
+test('existing-success, newer-input, stale-error, and manual reservations prevent automatic recovery', async t => {
+  for (const mode of ['success', 'new-input', 'stale', 'manual']) {
+    const f = await fixture(t, 'claude'); f.setQuota(quota(100));
+    const error = { type: 'assistant_message', text: "You've hit your session limit · resets 6:10am" };
+    f.setHistory([error, ...(mode === 'success' ? [{ type: 'assistant_message', text: 'Requested work completed.' }] : mode === 'new-input' ? [{ type: 'user_message', text: 'A newer request' }] : [])]);
+    if (mode === 'stale') f.agent.attentionTimestamp = new Date(NOW - 86400001).toISOString();
+    if (mode === 'manual') await f.reserve('My scheduled instruction');
+    await f.scheduler.change({ action: 'automatic', agentId: f.agent.id, enabled: true });
+    assert.equal((await f.jobs()).filter(j => j.source === 'automatic').length, 0); assert.equal(f.sent.length, 0);
+  }
+});
+test('a new request during automatic reset lookup cannot inherit the old failure reservation', async t => {
+  const f = await fixture(t, 'claude'); await f.scheduler.change({ action: 'automatic', agentId: f.agent.id, enabled: true });
+  let entered, release; const reading = new Promise(r => { entered = r; });
+  f.setQuota(() => { entered(); return new Promise(r => { release = () => r(quota(100)); }); });
+  const ending = f.scheduler.turnEnded(f.agent.id, failure, 'failed-turn'); await reading;
+  f.agent.lastUserMessageAt = new Date(NOW + 500).toISOString(); f.agent.activeTurn = { turnId: 'new-turn' }; f.agent.status = 'running';
+  release(); await ending; assert.equal((await f.jobs()).length, 0); assert.equal(f.sent.length, 0);
+});
+test('a quota failure before a manual scheduled-send acknowledgement creates the automatic follow-up', async t => {
+  const f = await fixture(t, 'claude'); await f.scheduler.change({ action: 'automatic', agentId: f.agent.id, enabled: true });
+  await f.reserve('Resume my work'); f.advance(1000);
+  f.setSend(async () => {
+    f.agent.lastUserMessageAt = new Date(f.now()).toISOString(); f.setQuota(quota(100, NOW + 60000));
+    await f.scheduler.turnEnded(f.agent.id, failure, 'early-failure');
+  });
+  await f.tick(); assert.equal((await f.jobs()).filter(j => j.source === 'automatic' && j.status === 'waiting').length, 1);
+  f.setSend(null); f.setQuota(quota(0)); f.advance(59000); await f.tick(); await f.tick();
+  assert.deepEqual(f.sent, ['Resume my work', 'Continue']);
 });
 test('unsupported host refuses scheduling and state version 2 migrates atomically', async t => {
   const f = await fixture(t); f.scheduler.dispose(); const unsupported = new ScheduleManager(f.manager, f.now); unsupported.connect(f.paseo); t.after(() => unsupported.dispose());
