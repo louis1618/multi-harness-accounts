@@ -5,6 +5,7 @@
 2026-10-05
 
 - `여러 프로젝트들`에서 최근 전송 메시지가 독립 프로필의 네이티브 기록에 존재하지만 Paseo 제출 행의 providerMessageId가 누락된 상태 확인. 비공개 백업 후 유휴 세션만 네이티브 기록으로 다시 읽어 실제 UUID 연결 복구. 동일 세션 ID와 기존 user/assistant 기록 3,697개·원본 파일 prefix 보존. CLI가 관리하는 last-prompt/mode/cost-state 메타데이터 3행만 추가되었으며 운영 프롬프트 전송은 하지 않음.
+- 연결 복구 후 사용자의 실제 conversation 되감기 완료 로그 확인. 변경된 native fork와 Paseo의 canonical 대화 tail이 비어 있지 않고, 메시지 UUID로 정상 조회됨을 확인. 해당 되감기는 사용자가 실행했으며 검증용 메시지를 보내지 않음.
 - 설치된 AppImage의 Claude 어댑터가 제출 행 연결을 0ms 타이머로 미뤄 즉시 실패 때 누락되는 원인 확인. 입력 큐에 넣은 뒤 UUID 연결을 즉시 발행하고 이미 준비한 query에서 pump를 시작하도록 수정. 새 query 생성 시 pending 설정을 소비. 기존 되감기 자격 검사와 파일 체크포인트 검증 유지.
 - 예약 호스트 준비 도구에 해당 수정 포함. 알려지지 않은 버전·변경된 코드·불완전한 수정은 쓰기 전에 거부하고 기존 호스트 수정과 원본 백업 유지. 준비 도구 반복 실행 검사 2개 통과.
 - 0.10.3 소스 회귀 검사 4개 통과: 생각 강도 변경 후 첫/재시작 요청, 즉시 실패의 UUID 유지, manager에서 실제 SDK checkpoint UUID 전달. 변경 파일 lint·format과 Claude 범위 타입 검사 수행. 서버 전체 타입 검사에는 기존 checkout/owned-subscriptions 진단 3개가 남아 있음.
