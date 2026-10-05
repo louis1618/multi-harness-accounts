@@ -12,3 +12,4 @@ harness-accounts/
 
 .extensions-native-*/
 paseo-extensions-*/
+quota-cache.json

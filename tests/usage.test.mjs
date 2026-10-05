@@ -350,3 +350,28 @@ test("failed login-state lookups and recovered old login errors do not ask a val
   assert.equal(snapshot.accounts[0].status,'signed-in');assert.equal(snapshot.accounts[0].error,null);
   assert.equal(snapshot.systemAccounts.find(r=>r.harness==='claude').error,null);
 });
+
+test('persisted quota values and Retry-After survive reload without native queries or secrets', async t => {
+  const root = await temporary(t), file = join(root, 'quota-cache.json'); let now = 1000, calls = 0;
+  const cache = new QuotaCache(() => now); await cache.restore(file);
+  cache.get('claude:profile:identity', async () => { calls++; return limit(); }); await cache.settled();
+  now += 300001;
+  cache.get('claude:profile:identity', async () => { calls++; throw new QuotaError('error', '한도 조회 요청이 많습니다.', 120000); }); await cache.settled();
+  const saved = JSON.parse(await readFile(file, 'utf8')); assert.equal(saved['claude:profile:identity'].value.windows[0].usedPercent, 25);
+  cache.stop(); const restored = new QuotaCache(() => now); await restored.restore(file); t.after(() => restored.stop());
+  const load = async () => { calls++; return limit(); };
+  const value = restored.get('claude:profile:identity', load, true);
+  assert.equal(value.status, 'error'); assert.equal(value.retryAt, new Date(now + 120000).toISOString());
+  await assert.rejects(restored.read('claude:profile:identity', load), error => error.retryAfterMs === 120000);
+  assert.equal(calls, 2); now += 120000; assert.equal((await restored.read('claude:profile:identity', load)).status, 'available'); assert.equal(calls, 3);
+});
+test('fresh safety reads share in-flight queries and keep upstream backoff despite forced refresh', async () => {
+  let now = 0, calls = 0, release; const cache = new QuotaCache(() => now);
+  const load = () => { calls++; return new Promise(resolve => { release = resolve; }); };
+  const first = cache.read('profile', load), second = cache.read('profile', load);
+  await new Promise(setImmediate); assert.equal(calls, 1); release(limit()); await Promise.all([first, second]);
+  const failed = async () => { calls++; throw new QuotaError('error', 'private-token-secret', 60000); };
+  await assert.rejects(cache.read('profile', failed), /한도를 조회하지/);
+  for (let i = 0; i < 10; i++) { cache.get('profile', load, true); await assert.rejects(cache.read('profile', load)); }
+  assert.equal(calls, 2); assert.ok(!JSON.stringify(cache.get('profile', load)).includes('private-token-secret')); cache.stop();
+});

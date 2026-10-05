@@ -49,7 +49,7 @@ export default function contribute(server: PluginServerContext) {
   server.handle(importAccountSession, (input, { paseo }) => safe(manager.importSession(input.id, paseo)));
   server.handle(prepareReset, input => safe(manager.prepareReset(input.accountId, input.harness)));
   server.handle(consumeReset, input => safe(manager.consumeReset(input.attemptId, input.creditId, input.confirmed)));
-  server.handle(listSchedules, (input, { paseo }) => { schedules.connect(paseo); return safe(schedules.list(input.agentId)); });
+  server.handle(listSchedules, (input, { paseo }) => { schedules.connect(paseo); return safe(schedules.list(input.agentId, input.refresh)); });
   server.handle(changeSchedule, (input, { paseo }) => { schedules.connect(paseo); return safe(schedules.change(input)); });
   server.before("agent.session_open", ({ request }, { paseo }) => safe((async () => {
     extensions.setPaseo(paseo); const result = await manager.openSession(request, paseo);

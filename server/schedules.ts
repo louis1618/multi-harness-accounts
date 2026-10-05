@@ -4,7 +4,7 @@ import { HarnessSchema, type Quota } from "../shared/accounts.js";
 import { activeSchedule, scheduleCard, type Schedule } from "../shared/schedules.js";
 import { AccountManager, selectedAccount, isUsageLimitFailure } from "./manager.js";
 import { AccountError } from "./store.js";
-import { QuotaError, QuotaCache, applicableQuotaWindows, hasRemainingQuota } from "./usage.js";
+import { QuotaError, applicableQuotaWindows, hasRemainingQuota } from "./usage.js";
 
 type PaseoApi = PluginHandlerContext["paseo"];
 type Agent = NonNullable<Awaited<ReturnType<ReturnType<PaseoApi["agents"]["ref"]>["refresh"]>>>["agent"];
@@ -30,7 +30,6 @@ export class ScheduleManager {
   private timer?: ReturnType<typeof setTimeout>;
   private running?: Promise<void>;
   private watches = new Map<string, () => void>();
-  private quotas = new QuotaCache();
   constructor(readonly accounts: AccountManager, private now: () => number = Date.now) {}
   start(paseo: PaseoApi, supported: boolean) {
     this.paseo = paseo; this.supported = supported;
@@ -53,21 +52,27 @@ export class ScheduleManager {
     const adapter = this.accounts.adapters[harness], home = binding?.home ?? (account ? this.accounts.profile(account) : adapter.systemHome);
     return { agent, state, binding, harness, accountId, adapter, home, accountLabel: account?.label ?? "시스템 계정" };
   }
-  async list(agentId?: string) {
+  async list(agentId?: string, refresh = false) {
     const state = await this.accounts.store.read();
     let defaultAt: string | null = null, resetReason: string | null = null, error: string | null = null;
+    let retryAt: string | null = null, quotaFetchedAt: string | null = null;
     let context: { harness: "codex" | "claude"; accountLabel: string } | null = null;
     if (agentId && this.paseo) try {
       const c = await this.context(agentId);
       context = { harness: c.harness, accountLabel: c.accountLabel };
-      const quota = this.quotas.get(`${c.harness}:${c.accountId ?? "system"}:${c.home}:${c.binding?.identity ?? ""}`, signal => c.adapter.quota(c.home, c.accountId === null, signal));
-      const reset = resetFor(quota, modelOf(c.agent), this.now()); defaultAt = reset.at; resetReason = quota.status === "loading" ? "초기화 시각 조회 중…" : reset.reason;
-      if (quota.status === "error" || quota.status === "auth-required") error = "한도를 조회하지 못했습니다. 인증·연결을 확인하거나 시간을 직접 지정하세요.";
-    } catch { error = "초기화 시각을 조회하지 못했습니다. 시간을 직접 지정하거나 잠시 후 다시 시도하세요."; }
+      const quota = await this.accounts.quota(c.harness, c.accountId, { home: c.home, mode: refresh ? "refresh" : "cached" });
+      const reset = resetFor(quota, modelOf(c.agent), this.now()); defaultAt = reset.at;
+      retryAt = quota.retryAt ?? null; quotaFetchedAt = quota.fetchedAt;
+      if (quota.status === "loading") resetReason = "초기화 시각 조회 중…";
+      else if (quota.status !== "available" || quota.error) {
+        error = quota.error ?? "한도를 조회하지 못했습니다. 잠시 후 다시 조회하세요.";
+        resetReason = defaultAt ? "마지막으로 조회한 초기화 시각입니다. 실행 전에 한도를 다시 확인합니다." : null;
+      } else resetReason = reset.reason;
+    } catch (cause) { error = this.accounts.publicError(cause); }
     return { supported: this.supported, jobs: Object.values(state.schedules.jobs).filter(j => !agentId || j.agentId === agentId)
       .sort((a, b) => Number(activeSchedule(b)) - Number(activeSchedule(a)) || (activeSchedule(a) ? a.dueAt.localeCompare(b.dueAt) : b.updatedAt.localeCompare(a.updatedAt))).map(scheduleCard),
       automatic: agentId ? state.schedules.automatic[agentId] ?? false : false, defaultAt, resetReason, context,
-      timezone: Intl.DateTimeFormat().resolvedOptions().timeZone, error };
+      timezone: Intl.DateTimeFormat().resolvedOptions().timeZone, error, retryAt, quotaFetchedAt };
   }
   async change(input: { action: "save"; agentId: string; message: string; dueAt: string } | { action: "cancel"; id: string } | { action: "automatic"; agentId: string; enabled: boolean }) {
     if (input.action === "cancel") {
@@ -160,7 +165,7 @@ export class ScheduleManager {
   }
   async wakeAgent(id: string) {
     await this.accounts.store.update(s => { for (const job of Object.values(s.schedules.jobs))
-      if (job.agentId === id && job.status === "waiting" && job.waitingFor) job.nextAttemptAt = null; });
+      if (job.agentId === id && job.status === "waiting" && job.waitingFor && job.waitingFor !== "quota") job.nextAttemptAt = null; });
     void this.kick();
   }
   private async restoreAutomatic() {
@@ -208,13 +213,19 @@ export class ScheduleManager {
     void this.kick();
   }
   private async reserveAutomatic(id: string) {
+    let expectedLastUserAt: string | null | undefined;
     try {
-      const c = await this.context(id), quota = await c.adapter.quota(c.home, c.accountId === null), reset = resetFor(quota, modelOf(c.agent), this.now());
+      const c = await this.context(id); expectedLastUserAt = c.agent.lastUserMessageAt ?? null;
+      const quota = await this.accounts.quota(c.harness, c.accountId, { home: c.home }), reset = resetFor(quota, modelOf(c.agent), this.now());
       if (quota.status !== "available" || quota.error) throw new Error("quota-pending");
       if (reset.at) await this.save(id, "Continue", reset.at, "automatic", undefined, c.agent.lastUserMessageAt);
       else await this.save(id, "Continue", this.iso(), "automatic", "초기화 시각을 확인하지 못했습니다. 실행 시간을 직접 지정하세요.", c.agent.lastUserMessageAt);
-    } catch {
-      await this.save(id, "Continue", this.iso(), "automatic", "계정·사용량을 조회하지 못했습니다. 상태를 확인하고 예약 시간을 직접 지정하세요.").catch(() => {});
+    } catch (error) {
+      if (error instanceof QuotaError && error.status === "error") {
+        const at = new Date(this.now() + Math.max(1000, error.retryAfterMs)).toISOString();
+        const job = await this.save(id, "Continue", at, "automatic", undefined, expectedLastUserAt).catch(() => null);
+        if (job?.source === "automatic" && job.status === "waiting") await this.mark(job, "waiting", `${error.message} 조회가 복구되면 초기화 시각에 예약합니다.`, { nextAttemptAt: at, waitingFor: "quota" });
+      } else await this.save(id, "Continue", this.iso(), "automatic", "계정·사용량을 조회하지 못했습니다. 상태를 확인하고 예약 시간을 직접 지정하세요.", expectedLastUserAt).catch(() => {});
     }
   }
   kick(): Promise<void> {
@@ -275,10 +286,13 @@ export class ScheduleManager {
       const auth = await c.adapter.status(c.home, c.accountId === null);
       if (!auth.signedIn) { await this.mark(job, "attention", "계정에 로그인한 후 예약을 다시 지정하세요."); return; }
       if (job.identity && auth.identity !== job.identity) { await this.mark(job, "canceled", "로그인된 실제 계정이 변경되어 예약을 취소했습니다."); return; }
-      const quota = await c.adapter.quota(c.home, c.accountId === null);
+      const quota = await this.accounts.quota(c.harness, c.accountId, { home: c.home });
       if (quota.status === "auth-required") { await this.mark(job, "attention", "계정 인증을 확인한 후 예약을 다시 지정하세요."); return; }
       if (quota.status !== "available" || quota.error || !applicableQuotaWindows(quota, modelOf(c.agent)).length) throw new Error("quota-pending");
       const reset = resetFor(quota, modelOf(c.agent), this.now());
+      if (job.waitingFor === "quota") {
+        await this.mark(job, reset.at ? "waiting" : "attention", reset.reason, reset.at ? { dueAt: reset.at, nextAttemptAt: null, waitingFor: null } : { waitingFor: null }); return;
+      }
       if (reset.blocked) {
         if (reset.stale && this.now() - Date.parse(job.dueAt) < 300000) {
           await this.mark(job, "waiting", "초기화 시각이 지났습니다. 서비스의 한도 갱신을 기다리고 있습니다.", { nextAttemptAt: new Date(this.now() + 30000).toISOString() }); return;
@@ -310,11 +324,11 @@ export class ScheduleManager {
     } catch (error) {
       if (error instanceof AccountError && /보관|삭제|찾지/.test(error.message)) await this.mark(job, "canceled", "세션 또는 계정이 삭제·보관되어 예약을 취소했습니다.");
       else if (error instanceof QuotaError && error.status === "auth-required") await this.mark(job, "attention", "계정 인증을 확인한 후 예약을 다시 지정하세요.");
-      else await this.mark(job, "waiting", "연결·사용량 조회를 다시 확인하고 있습니다.", { nextAttemptAt: new Date(this.now() + 60000).toISOString() });
+      else await this.mark(job, "waiting", error instanceof QuotaError ? error.message : "연결·사용량 조회를 다시 확인하고 있습니다.", { nextAttemptAt: new Date(this.now() + (error instanceof QuotaError ? Math.max(1000, error.retryAfterMs) : 60000)).toISOString() });
     }
   }
   dispose() {
-    this.disposed = true; this.quotas.stop(); if (this.timer) clearTimeout(this.timer);
+    this.disposed = true; if (this.timer) clearTimeout(this.timer);
     for (const stop of this.watches.values()) stop(); this.watches.clear();
   }
 }

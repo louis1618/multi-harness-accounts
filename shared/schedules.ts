@@ -10,13 +10,14 @@ export const ScheduleCardSchema = z.object({
   harness: z.enum(["codex", "claude"]), accountLabel: z.string(), message: z.string().trim().min(1).max(16000),
   dueAt: z.string().datetime(), status: ScheduleStatus, reason: z.string(),
   source: z.enum(["manual", "automatic"]), updatedAt: z.string().datetime(),
+  waitingFor: z.enum(["busy", "permissions", "quota"]).nullable().optional(),
 }).strict();
 export const ScheduleSchema = ScheduleCardSchema.extend({
   accountId: z.string().uuid().nullable(), identity: z.string().nullable(), generation: z.string(),
   sessionId: z.string().nullable(), lastUserMessageAt: z.string().nullable(),
   messageId: z.string().uuid(), revision: z.number().int().positive(), createdAt: z.string().datetime(),
   nextAttemptAt: z.string().datetime().nullable(), timelineDirty: z.boolean(),
-  waitingFor: z.enum(["busy", "permissions"]).nullable().default(null),
+  waitingFor: z.enum(["busy", "permissions", "quota"]).nullable().default(null),
   retryAfterSend: z.boolean().default(false), retryUserMessageAt: z.string().nullable().default(null),
 }).strict();
 export type Schedule = z.infer<typeof ScheduleSchema>;
@@ -29,13 +30,14 @@ export const ScheduleStateSchema = z.object({
 export const activeSchedule = (job: Pick<Schedule, "status">) => job.status === "waiting" || job.status === "sending";
 export const scheduleCard = (job: Schedule): ScheduleCard => ScheduleCardSchema.parse({
   id: job.id, agentId: job.agentId, title: job.title, harness: job.harness, accountLabel: job.accountLabel,
-  message: job.message, dueAt: job.dueAt, status: job.status, reason: job.reason, source: job.source, updatedAt: job.updatedAt,
+  message: job.message, dueAt: job.dueAt, status: job.status, reason: job.reason, source: job.source, updatedAt: job.updatedAt, waitingFor: job.waitingFor,
 });
 const AgentId = z.string().min(1).max(128).regex(/^[A-Za-z0-9_-]+$/);
-export const listSchedules = defineRpc({ name: "accounts.schedules.list", input: z.object({ agentId: AgentId.optional() }).strict(),
+export const listSchedules = defineRpc({ name: "accounts.schedules.list", input: z.object({ agentId: AgentId.optional(), refresh: z.boolean().optional() }).strict(),
   output: z.object({ supported: z.boolean(), jobs: z.array(ScheduleCardSchema), automatic: z.boolean(),
     context: z.object({ harness: ScheduleCardSchema.shape.harness, accountLabel: z.string() }).strict().nullable().default(null),
-    defaultAt: z.string().datetime().nullable(), resetReason: z.string().nullable(), timezone: z.string(), error: z.string().nullable() }).strict() });
+    defaultAt: z.string().datetime().nullable(), resetReason: z.string().nullable(), timezone: z.string(), error: z.string().nullable(),
+    retryAt: z.string().datetime().nullable().default(null), quotaFetchedAt: z.string().datetime().nullable().default(null) }).strict() });
 export const changeSchedule = defineRpc({ name: "accounts.schedules.change", input: z.discriminatedUnion("action", [
   z.object({ action: z.literal("save"), agentId: AgentId, message: ScheduleCardSchema.shape.message, dueAt: z.string().datetime() }).strict(),
   z.object({ action: z.literal("cancel"), id: z.string().uuid() }).strict(),

@@ -18,7 +18,7 @@ async function fixture(t, harness = 'codex') {
   let clock = NOW, q = quota(0), signedIn = true, identity = 'identity-A', sendHook, history = [];
   const account = { id: randomUUID(), harness, label: 'A', createdAt: new Date(NOW).toISOString() };
   const adapter = { systemHome: root, status: async () => ({ signedIn, identity, email: 'fixture@example.test' }), quota: async () => { if (q instanceof Error) throw q; return typeof q === 'function' ? q() : q; } };
-  const manager = new AccountManager({ root, adapters: { codex: adapter, claude: adapter } }); t.after(() => manager.dispose());
+  const manager = new AccountManager({ root, adapters: { codex: adapter, claude: adapter }, now: () => clock }); t.after(() => manager.dispose());
   const agent = { id: 'fixture-agent', title: 'Fixture', provider: harness, model: harness === 'codex' ? 'gpt-6' : 'claude-sonnet-4', status: 'idle', activeTurn: null,
     lastUserMessageAt: new Date(NOW - 1000).toISOString(), persistence: { sessionId: 'native-session' }, pendingPermissions: [] };
   await manager.store.update(s => {
@@ -268,7 +268,7 @@ test('service rollover delay is retried and missing automatic reset data is visi
   assert.equal((await f.jobs())[0].status, 'waiting'); f.setQuota(quota(0)); f.advance(30000); await f.tick(); assert.equal(f.sent.length, 1);
   const g = await fixture(t); await g.scheduler.change({ action: 'automatic', agentId: g.agent.id, enabled: true });
   g.setQuota(new QuotaError('error', 'private-native-error')); await g.scheduler.turnEnded(g.agent.id, failure, 'missing-reset');
-  const [job] = await g.jobs(); assert.equal(job.status, 'attention'); assert.equal(g.cards.get(job.id).status, 'attention');
+  const [job] = await g.jobs(); assert.equal(job.status, 'waiting'); assert.equal(job.waitingFor, 'quota'); assert.equal(g.cards.get(job.id).status, 'waiting');
   assert.ok(!JSON.stringify(job).includes('private-native-error'));
 });
 test('automatic failure deduplication survives restarting the scheduler', async t => {
@@ -290,4 +290,43 @@ test('a rewind branch does not replay an inherited old quota error during automa
  const f=await fixture(t,'claude');f.setQuota(quota(100));f.setHistory([{type:'assistant_message',text:"You've hit your session limit"}]);
  await f.manager.store.update(s=>{s.usage.finished[f.agent.id]='generation:previous-native-session:turn-1';});
  await f.scheduler.change({action:'automatic',agentId:f.agent.id,enabled:true});assert.equal((await f.jobs()).length,0);
+});
+
+test('quota errors show the cause and retry time without claiming reset data is absent', async t => {
+ const f=await fixture(t,'claude'); let calls=0;
+ f.setQuota(()=>{calls++;throw new QuotaError('error','한도 조회 요청이 많습니다. 잠시 후 다시 시도하세요.',120000);});
+ await f.scheduler.list(f.agent.id);await new Promise(setImmediate);
+ const result=await f.scheduler.list(f.agent.id,true);
+ assert.match(result.error,/요청이 많/);assert.equal(result.resetReason,null);assert.equal(result.defaultAt,null);
+ assert.equal(result.retryAt,new Date(NOW+120000).toISOString());assert.equal(calls,1);
+ assert.ok(!result.error.includes('인증'));f.advance(120000);f.setQuota(quota(0,NOW+3600000));
+ await f.scheduler.list(f.agent.id);await new Promise(setImmediate);const recovered=await f.scheduler.list(f.agent.id);
+ assert.equal(recovered.error,null);assert.equal(recovered.defaultAt,new Date(NOW+3600000).toISOString());
+});
+test('failed refresh retains the exact account last reset and timestamp while blocking transmission',async t=>{
+ const f=await fixture(t);await f.scheduler.list(f.agent.id);await new Promise(setImmediate);
+ const initial=await f.scheduler.list(f.agent.id);f.advance(300001);f.setQuota(new QuotaError('error','한도 조회 요청이 많습니다.',120000));
+ await f.scheduler.list(f.agent.id);await new Promise(setImmediate);const stale=await f.scheduler.list(f.agent.id);
+ assert.equal(stale.defaultAt,initial.defaultAt);assert.equal(stale.quotaFetchedAt,initial.quotaFetchedAt);assert.match(stale.resetReason,/마지막으로 조회/);
+ await f.reserve();f.advance(1000);await f.tick();assert.equal(f.sent.length,0);
+});
+test('dashboard and reservation use one quota cache for the same profile and identity',async t=>{
+ const f=await fixture(t),calls=[];const home=f.manager.profile(f.account);
+ await f.manager.store.update(s=>{s.bindings[f.agent.id].home=home;});
+ f.manager.adapters.codex.quota=async h=>{calls.push(h);return quota(20);};
+ f.paseo.agents.list=async()=>({entries:[],pageInfo:{hasMore:false,nextCursor:null}});
+ await f.manager.snapshot(f.paseo);await f.scheduler.list(f.agent.id);await new Promise(setImmediate);
+ const result=await f.scheduler.list(f.agent.id);const snapshot=await f.manager.snapshot(f.paseo);
+ assert.equal(calls.filter(h=>h===home).length,1);assert.equal(result.defaultAt,snapshot.accounts[0].metrics.quota.windows[0].resetsAt);
+});
+test('automatic reset lookup waits through Retry-After and schedules the real reset before sending',async t=>{
+ const f=await fixture(t,'claude');let calls=0;
+ f.setQuota(()=>{calls++;throw new QuotaError('error','한도 조회 요청이 많습니다.',120000);});
+ await f.scheduler.change({action:'automatic',agentId:f.agent.id,enabled:true});await f.scheduler.turnEnded(f.agent.id,failure,'limited');
+ let [job]=await f.jobs();assert.equal(job.status,'waiting');assert.equal(job.waitingFor,'quota');assert.equal(job.nextAttemptAt,new Date(NOW+120000).toISOString());
+ for(let i=0;i<4;i++){f.advance(20000);await f.scheduler.wakeAgent(f.agent.id);await f.tick();}
+ assert.equal(calls,1);assert.equal(f.sent.length,0);
+ f.setQuota(quota(100,NOW+180000));f.advance(40000);await f.tick();[job]=await f.jobs();
+ assert.equal(job.dueAt,new Date(NOW+180000).toISOString());assert.equal(job.waitingFor,null);assert.equal(f.sent.length,0);
+ f.setQuota(quota(0,NOW+3600000));f.advance(60000);await f.tick();await f.tick();assert.deepEqual(f.sent,['Continue']);
 });

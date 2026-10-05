@@ -339,38 +339,72 @@ export async function claudeConsumeReset(home: string, attemptId: string, credit
 }
 
 export class QuotaCache {
-  private entries = new Map<string, { value: Quota; nextAt: number; forceAt: number; pending: boolean }>();
+  private entries = new Map<string, { value: Quota; nextAt: number; forceAt: number; pending: boolean; operation?: Promise<void>; previous?: { value: Quota; nextAt: number; forceAt: number } }>();
   private controller = new AbortController();
+  private file?: string;
+  private writes: Promise<unknown> = Promise.resolve();
   // ponytail: serialize native quota processes; use a small worker pool if many accounts make refresh slow.
   private queue: Promise<unknown> = Promise.resolve();
   constructor(private now: () => number = Date.now) {}
-  get(key: string, load: (signal: AbortSignal) => Promise<Quota>, force = false): Quota {
+  async restore(file: string) {
+    this.file = file;
+    try {
+      const stat = await lstat(file);
+      if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 4 * 1024 * 1024) return;
+      for (const [key, saved] of Object.entries(JSON.parse(await readFile(file, "utf8"))) as [string, any][]) {
+        const value = QuotaSchema.safeParse(saved?.value);
+        if (value.success && value.data.status !== "loading" && Number.isFinite(saved.nextAt) && Number.isFinite(saved.forceAt))
+          this.entries.set(key, { value: value.data, nextAt: saved.nextAt, forceAt: saved.forceAt, pending: false });
+      }
+    } catch { /* Missing/invalid optional cache must not damage account or session metadata. */ }
+  }
+  private persist() {
+    if (!this.file || this.controller.signal.aborted) return Promise.resolve();
+    const file = this.file;
+    const operation = this.writes.then(() => atomicWrite(file, JSON.stringify(Object.fromEntries([...this.entries]
+      .filter(([, e]) => e.value.status !== "loading" || e.previous).map(([key, e]) => [key, e.value.status === "loading" ? e.previous : { value: e.value, nextAt: e.nextAt, forceAt: e.forceAt }])))));
+    this.writes = operation.catch(() => {});
+    return this.writes;
+  }
+  get(key: string, load: (signal: AbortSignal) => Promise<Quota>, force: boolean | "fresh" = false): Quota {
     const time = this.now();
     let entry = this.entries.get(key);
-    if (entry && (entry.pending || time < (force ? entry.forceAt : entry.nextAt))) return entry.value;
+    if (entry && (entry.pending || time < (force === "fresh" && entry.value.status === "available" ? 0 : force ? entry.forceAt : entry.nextAt))) return entry.value;
     entry ??= { value: unavailableQuota(), nextAt: 0, forceAt: 0, pending: false };
     this.entries.set(key, entry);
+    entry.previous = { value: entry.value, nextAt: entry.nextAt, forceAt: entry.forceAt };
     entry.pending = true; entry.forceAt = time + 10000; entry.value = { ...entry.value, status: "loading", error: null };
     const current = entry;
     const operation = this.queue.then(async () => {
-      if (this.controller.signal.aborted) return;
+      if (this.controller.signal.aborted) { current.pending = false; return; }
       try {
-        current.value = QuotaSchema.parse(await load(this.controller.signal));
+        current.value = { ...QuotaSchema.parse(await load(this.controller.signal)), retryAt: null };
         current.nextAt = this.now() + 5 * 60 * 1000;
       } catch (error) {
         const cause = error instanceof QuotaError ? error : new QuotaError("error", "한도를 조회하지 못했습니다. 잠시 후 새로고침하세요.");
-        current.value = { ...current.value, status: cause.status, error: cause.message };
+        current.value = { ...current.value, status: cause.status, error: /^[가-힣]/.test(cause.message) ? cause.message : "한도를 조회하지 못했습니다. 잠시 후 다시 조회하세요." };
         current.nextAt = this.now() + cause.retryAfterMs;
         current.forceAt = Math.max(current.forceAt, current.nextAt);
-      } finally { current.pending = false; }
+        current.value.retryAt = new Date(current.nextAt).toISOString();
+      } finally { current.pending = false; await this.persist(); }
     });
+    current.operation = operation;
     this.queue = operation.catch(() => {});
     return current.value;
   }
-  async settled() { await this.queue; }
-  clearRow(row: string) { for (const key of this.entries.keys()) if (key.startsWith(row + ":")) this.entries.delete(key); }
-  clearIdentity(identity: string) { for (const key of this.entries.keys()) if (key.endsWith(":" + identity)) this.entries.delete(key); }
-  put(key: string, value: Quota) { this.entries.set(key, { value, nextAt: this.now() + 300000, forceAt: this.now() + 10000, pending: false }); }
+  async read(key: string, load: (signal: AbortSignal) => Promise<Quota>): Promise<Quota> {
+    this.get(key, load, "fresh");
+    const entry = this.entries.get(key)!;
+    await entry.operation;
+    const value = entry.value;
+    if (value.status !== "available" || value.error) throw new QuotaError(value.status === "auth-required" || value.status === "unavailable" ? value.status : "error",
+      value.error ?? "한도를 확인하지 못했습니다. 잠시 후 다시 조회하세요.", Math.max(0, entry.nextAt - this.now()));
+    return value;
+  }
+  async settled() { await this.queue; await this.writes; }
+  clearRow(row: string) { for (const key of this.entries.keys()) if (key.startsWith(row + ":")) this.entries.delete(key); void this.persist(); }
+  clearIdentity(identity: string) { for (const key of this.entries.keys()) if (key.endsWith(":" + identity)) this.entries.delete(key); void this.persist(); }
+  put(key: string, value: Quota) { this.entries.set(key, { value, nextAt: this.now() + 300000, forceAt: this.now() + 10000, pending: false }); void this.persist(); }
   stop() { this.controller.abort(); this.entries.clear(); }
 }
 

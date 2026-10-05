@@ -62,7 +62,7 @@ export class AccountManager {
   private rotating = new Set<string>();
   private disposed = false;
   private ready?: Promise<void>;
-  private quotas = new QuotaCache();
+  private quotas: QuotaCache;
   private turnQueues = new Map<string, Promise<unknown>>();
   private resetting = new Set<string>();
   private nativeIndex: { fetchedAt: number; accounts: string; sessions: AccountSession[]; warnings: string[] } | null = null;
@@ -75,9 +75,10 @@ export class AccountManager {
     return next;
   }
   private restart: (id: string) => Promise<void>;
-  constructor(options: { root?: string; adapters?: Record<Harness, HarnessAdapter>; restart?: (id: string) => Promise<void> } = {}) {
+  constructor(options: { root?: string; adapters?: Record<Harness, HarnessAdapter>; restart?: (id: string) => Promise<void>; now?: () => number } = {}) {
     const daemonHome = resolve(process.env.PASEO_HOME ?? join(homedir(), ".paseo"));
     this.store = new Store(options.root ?? join(daemonHome, "harness-accounts"));
+    this.quotas = new QuotaCache(options.now);
     this.adapters = options.adapters ?? createAdapters({}, undefined, fetch, join(this.store.root, "browser"));
     this.restart = options.restart ?? (async id => {
       try {
@@ -90,8 +91,22 @@ export class AccountManager {
     });
   }
   profile(account: Account) { return join(this.store.root, account.harness, account.id); }
-  private initialize() { return this.ready ??= this.store.update(() => {}); }
+  private initialize() { return this.ready ??= (async () => { await this.store.update(() => {}); await this.quotas.restore(join(this.store.root, "quota-cache.json")); })(); }
   private row(harness: Harness, id: string | null) { return id ?? `system:${harness}`; }
+  private quotaKey(harness: Harness, id: string | null, home: string, identity: string | null) { return `${this.row(harness, id)}:${home}:${identity ?? "unknown"}`; }
+  async quota(harness: Harness, accountId: string | null, options: { home?: string; identity?: string | null; mode?: "cached" | "refresh" | "fresh" } = {}): Promise<Quota> {
+    await this.initialize();
+    const adapter = this.adapters[harness], state = await this.store.read();
+    const home = options.home ?? (accountId ? this.profile(this.account(state, accountId)) : adapter.systemHome);
+    let identity = options.identity;
+    if (identity === undefined) {
+      const auth = await adapter.status(home, accountId === null);
+      if (!auth.signedIn) throw new QuotaError("auth-required", "선택한 계정에 로그인한 후 한도를 조회하세요.", 300000);
+      identity = auth.identity;
+    }
+    const key = this.quotaKey(harness, accountId, home, identity), load = (signal: AbortSignal) => adapter.quota(home, accountId === null, signal);
+    return options.mode === "cached" || options.mode === "refresh" ? this.quotas.get(key, load, options.mode === "refresh") : this.quotas.read(key, load);
+  }
   private account(state: State, id: string) {
     const account = state.accounts.find(item => item.id === id);
     if (!account) throw new AccountError("계정을 찾지 못했습니다. 계정 화면을 새로고침하세요.");
@@ -114,7 +129,7 @@ export class AccountManager {
       if (principal && !sharedStatisticsWith) statisticsRows.set(principal, row);
       const home = id ? this.profile(this.account(state, id)) : this.adapters[harness].systemHome;
       return {
-        quota: signedIn ? this.quotas.get(`${row}:${identity ?? "unknown"}`,
+        quota: signedIn ? this.quotas.get(this.quotaKey(harness, id, home, identity),
           signal => this.adapters[harness].quota(home, id === null, signal), forceUsage) : unavailableQuota(lookupFailed
             ? "로그인 상태를 조회하지 못했습니다. 잠시 후 다시 조회하세요." : "로그인하면 한도를 확인할 수 있습니다."),
         statistics: { ...totals, totalTokens: totals.inputTokens + totals.outputTokens, available: principal !== null, startedAt: state.usage.startedAt },
@@ -207,7 +222,7 @@ export class AccountManager {
   }
   publicError(error: unknown): string {
     // All errors from our adapters and service are fixed messages. Never expose child stderr or OS error objects.
-    return error instanceof AccountError ? error.message : "계정 작업에 실패했습니다. 호스트 상태를 확인하고 다시 시도하세요.";
+    return error instanceof AccountError || error instanceof QuotaError && /^[가-힣]/.test(error.message) ? error.message : "계정 작업에 실패했습니다. 호스트 상태를 확인하고 다시 시도하세요.";
   }
   async sessions(paseo: PaseoApi, refresh = false) {
     await this.initialize();
@@ -312,10 +327,10 @@ export class AccountManager {
     if (!identity) throw new AccountError("로그인한 계정을 확인하지 못했습니다. 다시 로그인한 뒤 조회하세요.");
     if (this.resetting.has(identity)) throw new AccountError("리셋 요청 처리 중입니다. 완료 후 다시 조회하세요.");
     let quota;
-    try { quota = await adapter.quota(home, account === null); }
+    try { quota = await this.quota(harness, accountId, { home, identity: auth.identity }); }
     catch (error) { throw new AccountError(error instanceof QuotaError ? error.message : "리셋권을 조회하지 못했습니다. 잠시 후 다시 시도하세요."); }
     quota = this.blockUncertainCredits(quota, state, identity);
-    this.quotas.put(`${this.row(harness, accountId)}:${identity}`, quota);
+    this.quotas.put(this.quotaKey(harness, accountId, home, auth.identity), quota);
     const attempt = await this.store.update(next => {
       let value: State["resetAttempts"][string] | undefined = next.resetAttempts[identity];
       if (value?.harness === "claude" && value.stage === "pending" && value.submittedAt && Date.now() - Date.parse(value.submittedAt) >= 600000) {
@@ -350,7 +365,7 @@ export class AccountManager {
           throw new AccountError("Claude 리셋 결과 확인 기간 10분이 지났습니다. 재전송하지 않습니다. Claude 사용량 화면에서 확인하세요.");
         if (attempt.creditId !== creditId) throw new AccountError("결과가 확인되지 않은 요청은 선택한 리셋권을 변경할 수 없습니다.");
       } else {
-        const quota = this.blockUncertainCredits(await adapter.quota(home, account === null).catch(() => { throw new AccountError("최신 리셋권 정보를 확인하지 못했습니다. 다시 조회하세요."); }), state, attempt.identity);
+        const quota = this.blockUncertainCredits(await this.quota(harness, attempt.accountId, { home }).catch(() => { throw new AccountError("최신 리셋권 정보를 확인하지 못했습니다. 다시 조회하세요."); }), state, attempt.identity);
         const credits = quota.resetCredits;
         if (!credits || credits.availableCount === 0) throw new AccountError("사용 가능한 리셋권이 없습니다.");
         if (harness === "claude" && !creditId) throw new AccountError("사용할 Claude 리셋권을 선택하세요.");
@@ -755,7 +770,7 @@ export class AccountManager {
     if (!state.rotation[active.harness] || owns(state.pending, id)) return false;
     let exhausted = isUsageLimitFailure(event);
     if (!exhausted && event.outcome.kind === "failed" && /rate_limit|too many requests|\b429\b/i.test(`${event.outcome.error.code ?? ""} ${event.outcome.error.message}`)) {
-      try { exhausted = (await this.adapters[active.harness].quota(active.home, active.native)).windows.some(window => window.usedPercent >= 100); } catch { /* A transient 429 alone is not quota exhaustion. */ }
+      try { exhausted = (await this.quota(active.harness, state.bindings[id]?.accountId ?? null, { home: active.home })).windows.some(window => window.usedPercent >= 100); } catch { /* A transient 429 alone is not quota exhaustion. */ }
     }
     if (!exhausted) {
       if (previous && ["continued", "sending"].includes(previous.phase)) await this.store.update(next => {
@@ -767,7 +782,7 @@ export class AccountManager {
     }
     // A completed Claude turn can carry the native limit message. Confirm its actual quota first.
     if (event.outcome.kind === "completed") {
-      try { if (!(await this.adapters[active.harness].quota(active.home, active.native)).windows.some(window => window.usedPercent >= 100)) return false; }
+      try { if (!(await this.quota(active.harness, state.bindings[id]?.accountId ?? null, { home: active.home })).windows.some(window => window.usedPercent >= 100)) return false; }
       catch { return false; }
     }
     const lastUser = [...event.timeline].reverse().find(item => item.type === "user_message");
@@ -793,8 +808,7 @@ export class AccountManager {
       const adapter = this.adapters[harness], home = account ? this.profile(account) : adapter.systemHome;
       const auth = await adapter.status(home, account === null);
       if (!auth.signedIn || auth.identity !== identity) return false;
-      const quota = await adapter.quota(home, account === null);
-      this.quotas.put(`${this.row(harness, accountId)}:${identity}`, quota);
+      const quota = await this.quota(harness, accountId, { home, identity: auth.identity });
       return hasRemainingQuota(quota, model);
     } catch { return false; }
   }
@@ -832,8 +846,7 @@ export class AccountManager {
           try {
             const auth = await adapter.status(home, account === null);
             if (!auth.signedIn || !auth.identity || job.triedIdentities.includes(auth.identity)) continue;
-            const quota = await adapter.quota(home, account === null);
-            this.quotas.put(`${row}:${auth.identity}`, quota);
+            const quota = await this.quota(job.harness, accountId, { home, identity: auth.identity });
             if (!hasRemainingQuota(quota, current.agent.model ?? null)) continue;
             chosen = { id: accountId, identity: auth.identity, label: account?.label ?? "시스템 계정" }; break;
           } catch { /* An unavailable or unsafe profile is never selected. */ }

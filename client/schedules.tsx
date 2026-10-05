@@ -25,14 +25,17 @@ function useScheduleChange() {
 }
 function ScheduleForm({ agentId, colors, close, onOverview }: { agentId: string; colors: Colors; close: () => void; onOverview: () => void }) {
   const query = useSchedules(agentId), change = useScheduleChange();
+  const refreshRpc = useRpc(listSchedules), cache = useQueryClient();
+  const refresh = useMutation({ mutationFn: () => refreshRpc({ agentId, refresh: true }),
+    onSuccess: value => cache.setQueryData(["scheduled-messages", agentId], value) });
   const [message, setMessage] = useState("Continue"), [date, setDate] = useState(""), [time, setTime] = useState("");
   const [initialized, setInitialized] = useState(false), [error, setError] = useState<string | null>(null), [now, setNow] = useState(Date.now());
   const pending = query.data?.jobs.find(j => j.status === "waiting" || j.status === "sending") ?? query.data?.jobs.find(j => j.status === "attention");
   useEffect(() => {
     if (initialized || !query.data || !pending && (query.isFetching || query.data.resetReason === "초기화 시각 조회 중…")) return;
-    const at = pending?.dueAt ?? query.data.defaultAt;
+    const at = pending?.waitingFor === "quota" ? query.data.defaultAt : pending?.dueAt ?? query.data.defaultAt;
     if (at) { const parts = localDateTime(at); setDate(parts.date); setTime(parts.time); }
-    else setDate(localDateTime(new Date().toISOString()).date);
+    else { setDate(localDateTime(new Date().toISOString()).date); return; }
     if (pending) setMessage(pending.message);
     setInitialized(true);
   }, [query.data, query.isFetching, initialized, pending]);
@@ -68,12 +71,19 @@ function ScheduleForm({ agentId, colors, close, onOverview }: { agentId: string;
     </View>
     <View style={{ gap: 5 }}>
       <Text style={{ color: colors.foregroundMuted, fontSize: 13 }}>기기 시간대 · {timezone}</Text>
-      <Text accessibilityLiveRegion="polite" style={{ color: colors.foregroundMuted, fontSize: 14 }}>{dueAt ? formatResetCountdown(dueAt, now) : query.data?.resetReason ?? "초기화 시각 조회 중…"}</Text>
+      {(dueAt || query.data?.resetReason || query.isPending) && <Text accessibilityLiveRegion="polite" style={{ color: colors.foregroundMuted, fontSize: 14 }}>{dueAt ? formatResetCountdown(dueAt, now) : query.data?.resetReason ?? "초기화 시각 조회 중…"}</Text>}
       {query.data?.defaultAt && <Pressable accessibilityRole="button" accessibilityLabel="5시간·주간 한도 중 가장 빠른 초기화 시각으로 설정" style={{ minHeight: 44, justifyContent: "center" }}
         onPress={() => { const parts = localDateTime(query.data!.defaultAt!); setDate(parts.date); setTime(parts.time); setInitialized(true); }}>
         <Text style={{ color: colors.accent, fontSize: 14 }}>가장 빠른 초기화 · {dateLabel(query.data.defaultAt)}</Text>
       </Pressable>}
-      {query.data?.error && <Text style={{ color: colors.foregroundMuted, lineHeight: 21 }}>{query.data.error}</Text>}
+      {query.data?.error && <View style={{ gap: 6 }}>
+        <Text accessibilityRole="alert" style={{ color: colors.statusWarning, lineHeight: 21 }}>{query.data.error}</Text>
+        {query.data.quotaFetchedAt && <Text style={{ color: colors.foregroundMuted, fontSize: 13 }}>마지막 조회 · {dateLabel(query.data.quotaFetchedAt)}</Text>}
+        {query.data.retryAt && Date.parse(query.data.retryAt) > now && <Text style={{ color: colors.foregroundMuted, fontSize: 13 }}>자동 재조회 · {dateLabel(query.data.retryAt)} · {formatResetCountdown(query.data.retryAt, now)}</Text>}
+        <Button colors={colors} icon="RefreshCw" disabled={refresh.isPending || query.isFetching || !!query.data.retryAt && Date.parse(query.data.retryAt) > now}
+          onPress={() => refresh.mutate()}>한도 다시 조회</Button>
+      </View>}
+      {refresh.error && <Text accessibilityRole="alert" style={{ color: colors.statusDanger }}>{publicError(refresh.error)}</Text>}
     </View>
     <View style={{ borderTopWidth: 1, borderColor: colors.border, paddingTop: 8 }}>
       <SettingsSwitch label="사용량 소진 시 자동 재개" hint="이 세션의 현재 계정에서 5시간·주간 한도 중 가장 빠른 초기화 시각에 Continue를 예약합니다."
@@ -108,8 +118,8 @@ export function scheduleUI(client: PluginClientContext) {
     return <View style={{ gap: 12, padding: 16, borderWidth: 1, borderColor: colors.border, backgroundColor: colors.surface1, borderRadius: 12 }}>
       <Pressable accessibilityRole="button" accessibilityLabel="예약 메시지 목록에서 보기" onPress={() => open(job.id)} style={{ flexDirection: "row", gap: 10, alignItems: "center", minHeight: 44 }}>
         <Icon name="CalendarClock" size={20} color={colors.accent} />
-        <View style={{ flex: 1, gap: 3 }}><Text style={{ color: colors.foreground, fontSize: 15, fontWeight: "600" }}>예약 메시지 · {scheduleLabels[job.status]}</Text>
-          <Text style={{ color: colors.foregroundMuted, fontSize: 13 }}>{dateLabel(job.dueAt)}</Text></View>
+        <View style={{ flex: 1, gap: 3 }}><Text style={{ color: colors.foreground, fontSize: 15, fontWeight: "600" }}>예약 메시지 · {job.waitingFor === "quota" ? "초기화 시각 조회 대기" : scheduleLabels[job.status]}</Text>
+          <Text style={{ color: colors.foregroundMuted, fontSize: 13 }}>{job.waitingFor === "quota" ? "다음 한도 조회 · " : ""}{dateLabel(job.dueAt)}</Text></View>
         <Icon name="ChevronRight" size={16} color={colors.foregroundMuted} />
       </Pressable>
       <Text style={{ color: colors.foreground, fontSize: 15, lineHeight: 23 }}>{job.message}</Text>
@@ -144,11 +154,11 @@ export function scheduleUI(client: PluginClientContext) {
             <Icon name="CalendarClock" size={22} color={colors.accent} />
             <View style={{ flex: 1, gap: 5 }}><Text style={{ color: colors.foreground, fontSize: 17, fontWeight: "600" }}>{job.title}</Text>
               <Text style={{ color: colors.foregroundMuted, fontSize: 13 }}>{harnessLabels[job.harness]} · {job.accountLabel}</Text></View>
-            <Text style={{ color: job.status === "attention" ? colors.statusWarning : colors.foregroundMuted, fontSize: 13 }}>{scheduleLabels[job.status]}</Text>
+            <Text style={{ color: job.status === "attention" ? colors.statusWarning : colors.foregroundMuted, fontSize: 13 }}>{job.waitingFor === "quota" ? "조회 대기" : scheduleLabels[job.status]}</Text>
             {props.navigation && <Icon name="ChevronRight" size={16} color={colors.foregroundMuted} />}
           </Pressable>
           <Text style={{ color: colors.foreground, fontSize: 15, lineHeight: 23 }}>{job.message}</Text>
-          <View style={{ gap: 4 }}><Text style={{ color: colors.foreground, fontSize: 14 }}>{dateLabel(job.dueAt)}</Text>
+          <View style={{ gap: 4 }}><Text style={{ color: colors.foreground, fontSize: 14 }}>{job.waitingFor === "quota" ? "다음 한도 조회 · " : ""}{dateLabel(job.dueAt)}</Text>
             <Text style={{ color: colors.foregroundMuted, fontSize: 13, lineHeight: 20 }}>{job.reason}</Text></View>
           {(job.status === "waiting" || job.status === "attention") && <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 8 }}>
             <Button colors={colors} onPress={() => setEditAgent(job.agentId)}>수정</Button>
