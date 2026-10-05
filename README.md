@@ -2,7 +2,7 @@
 
 Paseo Sidebar의 **계정**에서 Codex와 Claude Code의 네이티브 로그인 계정을 관리하는 로컬 플러그인입니다. 독립 프로필 디렉터리를 실제 하네스 프로세스에 전달합니다.
 
-## 예약 메시지 · 1.5.5
+## 예약 메시지 · 1.5.6
 
 독립 Claude OAuth 프로필의 로그인 상태는 로컬 인증·계정 정보로 확인해 화면 조회마다 CLI의 네트워크 초기화를 실행하지 않습니다. 서버 요청 제한에는 최근 조회 실패와 서버가 지정한 다음 조회 **시도** 시각을 표시합니다. 재시도 시각은 조회 복구를 보장하는 시각이 아닙니다.
 
@@ -19,7 +19,7 @@ Paseo Sidebar의 **계정**에서 Codex와 Claude Code의 네이티브 로그인
 
 예약 실행은 **Paseo 0.10.3 호스트 확장**이 필요합니다. 지원하지 않는 호스트에서는 예약 실행을 차단하고 업데이트 안내를 표시합니다. 기존 계정·사용량·확장 관리는 계속 사용할 수 있습니다. 입력창 팝오버·모바일 하단 시트와 채팅 카드에는 [Paseo 플러그인 SDK](https://paseo.sh/docs/plugins/reference#composer-pills)를 사용합니다.
 
-호스트 변경 소스는 `host/paseo-0.10.3.patch`, 준비된 런타임에 적용하는 도구는 `host/install-guard.mjs`입니다. 도구는 대상 버전과 수정 위치를 검사하고 기존 파일을 백업합니다. 앱이나 daemon을 재시작하지 않습니다. SDK에 시작 시 daemon API와 `guardedAgentMessages` 기능 표시를 추가하고, 예약 전송을 native 실행 선점 직전에 검사합니다.
+호스트 변경 소스는 `host/paseo-0.10.3.patch`, 준비된 런타임에 적용하는 도구는 `host/install-guard.mjs`입니다. 도구는 대상 버전과 수정 위치를 검사하고 기존 파일을 백업합니다. 앱이나 daemon을 재시작하지 않습니다. SDK에 시작 시 daemon API와 `guardedAgentMessages` 기능 표시를 추가하고, 예약 전송을 native 실행 선점 직전에 검사합니다. 같은 준비 단계에서 `host/install-rewind.mjs`의 Claude 메시지 ID 연결 수정도 함께 적용해 즉시 실패한 요청의 되감기가 막히지 않도록 합니다. 소스 패치는 `host/claude-rewind-0.10.3.patch`입니다. 이 호스트 수정은 플러그인 reload만으로 활성화되지 않으며 수정된 Paseo 호스트 재시작이 필요합니다.
 
 예약과 자동 재개 설정은 기존 `metadata.json`의 버전 3에 원자적으로 저장합니다. 버전 1·2 계정·선택·사용 통계는 유지됩니다. 인증 토큰·프로필 경로·내부 계정 식별자는 예약 조회 RPC나 채팅 카드에 포함하지 않습니다.
 

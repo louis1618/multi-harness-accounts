@@ -3,6 +3,7 @@
 import { readFile, writeFile, copyFile } from 'node:fs/promises';
 import { resolve, join } from 'node:path';
 import { pathToFileURL } from 'node:url';
+import { installRewind } from './install-rewind.mjs';
 
 export async function installGuard(runtime) {
   const modules = join(resolve(runtime), 'node_modules', '@getpaseo');
@@ -20,7 +21,7 @@ export async function installGuard(runtime) {
       ['server/dist/server/server/agent/agent-prompt.js','SCHEDULE_GUARD_CHANGED'], ['server/dist/server/server/session.js','sendGuard: msg.sendGuard'],
       ['server/dist/server/server/message-receipts/index.js','SCHEDULE_GUARD_(BUSY|CHANGED|ARCHIVED)']])
       if (!(await readFile(join(modules,file),'utf8')).includes(token)) throw Error('Partial host extension. Restore the .before-scheduled-messages files first.');
-    return [];
+    return await installRewind(runtime);
   }
   await replace('protocol/dist/messages.js', 'export const SendAgentMessageRequestSchema = z.object({\n', 'export const SendAgentMessageRequestSchema = z.object({\n    sendGuard: z.object({ lastUserMessageAt: z.string().nullable(), provider: z.string().optional(), sessionId: z.string().optional() }).optional(),\n');
   await replace('client/dist/daemon-client.js', '...(options?.activeTurnBehavior ? { activeTurnBehavior: options.activeTurnBehavior } : {}),', '...(options?.activeTurnBehavior ? { activeTurnBehavior: options.activeTurnBehavior } : {}),\n            ...(options?.sendGuard ? { sendGuard: options.sendGuard } : {}),');
@@ -56,7 +57,7 @@ export async function installGuard(runtime) {
     await copyFile(file, file+'.before-scheduled-messages');
     await writeFile(file, contents);
   }
-  return [...changes.keys()];
+  return [...changes.keys(), ...await installRewind(runtime)];
 }
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
   if (!process.argv[2]) throw Error('Usage: node host/install-guard.mjs /absolute/path/to/staging-runtime');
