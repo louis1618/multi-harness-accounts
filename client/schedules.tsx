@@ -76,7 +76,7 @@ function ScheduleForm({ agentId, colors, close, onOverview }: { agentId: string;
       {query.data?.error && <Text style={{ color: colors.foregroundMuted, lineHeight: 21 }}>{query.data.error}</Text>}
     </View>
     <View style={{ borderTopWidth: 1, borderColor: colors.border, paddingTop: 8 }}>
-      <SettingsSwitch label="사용량 소진 시 자동 재개" hint="이 세션에서만 적용됩니다. 다음 계정으로 전환할 수 없으면 초기화 시각에 Continue를 예약합니다."
+      <SettingsSwitch label="사용량 소진 시 자동 재개" hint="이 세션의 현재 계정에서 5시간·주간 한도 중 가장 빠른 초기화 시각에 Continue를 예약합니다."
         value={query.data?.automatic ?? false} disabled={!supported || change.isPending}
         onValueChange={enabled => change.mutate({ action: "automatic", agentId, enabled })} />
     </View>

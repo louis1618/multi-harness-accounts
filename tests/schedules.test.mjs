@@ -177,7 +177,7 @@ test('unknown acknowledgement reconciles canonical message; unknown receipt is n
   const g = await fixture(t); await g.reserve(); g.advance(1000); g.setSend(() => { throw Error('outcome-unknown'); }); await g.tick(); await g.tick();
   assert.equal(g.calls.length, 1); assert.equal((await g.jobs())[0].status, 'attention');
 });
-test('automatic resume is opt-in and rotation takes precedence', async t => {
+test('automatic reset reservations are opt-in and independent of account rotation', async t => {
   const f = await fixture(t); f.setQuota(quota(100)); await f.scheduler.turnEnded(f.agent.id, failure, 'off'); assert.equal((await f.jobs()).length, 0);
   await f.scheduler.change({ action: 'automatic', agentId: f.agent.id, enabled: true });
   await f.scheduler.turnEnded(f.agent.id, failure, 'on'); await f.scheduler.turnEnded(f.agent.id, failure, 'on'); assert.equal((await f.jobs()).length, 1);
@@ -186,7 +186,8 @@ test('automatic resume is opt-in and rotation takes precedence', async t => {
   await g.manager.store.update(s => { s.rotations[g.agent.id] = { harness: 'codex', sessionId: 'native-session', failedKey: 'failure', phase: 'continued',
     fromAccountId: g.account.id, targetAccountId: g.account.id, originalOverride: 'inherit', triedRows: [], triedIdentities: [], messageId: randomUUID(),
     lastUserMessageAt: g.agent.lastUserMessageAt, updatedAt: new Date(NOW).toISOString(), message: 'Fixture' }; });
-  await g.scheduler.turnEnded(g.agent.id, failure, 'rotation'); assert.equal((await g.jobs()).length, 0);
+  await g.scheduler.turnEnded(g.agent.id, failure, 'rotation'); assert.equal((await g.jobs()).length, 1);
+  assert.equal((await g.jobs())[0].accountId, g.account.id); assert.equal((await g.jobs())[0].message, 'Continue');
 });
 test('native Claude completed session-limit replies create a reset reservation and resume exactly once', async t => {
   const f = await fixture(t, 'claude'); f.setQuota(quota(100, NOW + 60000));
@@ -276,4 +277,17 @@ test('automatic failure deduplication survives restarting the scheduler', async 
   await f.scheduler.change({ action: 'cancel', id: job.id }); f.scheduler.dispose();
   const restored = new ScheduleManager(f.manager, f.now); t.after(() => restored.dispose()); restored.start(f.paseo, true);
   await restored.turnEnded(f.agent.id, failure, 'same-turn'); assert.equal((await f.jobs()).length, 1); assert.equal((await f.jobs())[0].status, 'canceled');
+});
+
+test('scheduled reset messages wait while current-account limits are unknown or absent',async t=>{
+ for(const status of ['unavailable','empty','error']){
+  const f=await fixture(t);await f.reserve();f.advance(1000);
+  const q=quota(0);f.setQuota(status==='empty'?{...q,windows:[]}:{...q,status});await f.tick();
+  assert.equal(f.sent.length,0);assert.equal((await f.jobs())[0].status,'waiting');
+ }
+});
+test('a rewind branch does not replay an inherited old quota error during automatic recovery',async t=>{
+ const f=await fixture(t,'claude');f.setQuota(quota(100));f.setHistory([{type:'assistant_message',text:"You've hit your session limit"}]);
+ await f.manager.store.update(s=>{s.usage.finished[f.agent.id]='generation:previous-native-session:turn-1';});
+ await f.scheduler.change({action:'automatic',agentId:f.agent.id,enabled:true});assert.equal((await f.jobs()).length,0);
 });

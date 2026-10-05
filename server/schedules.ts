@@ -4,14 +4,13 @@ import { HarnessSchema, type Quota } from "../shared/accounts.js";
 import { activeSchedule, scheduleCard, type Schedule } from "../shared/schedules.js";
 import { AccountManager, selectedAccount, isUsageLimitFailure } from "./manager.js";
 import { AccountError } from "./store.js";
-import { QuotaError, QuotaCache } from "./usage.js";
+import { QuotaError, QuotaCache, applicableQuotaWindows, hasRemainingQuota } from "./usage.js";
 
 type PaseoApi = PluginHandlerContext["paseo"];
 type Agent = NonNullable<Awaited<ReturnType<ReturnType<PaseoApi["agents"]["ref"]>["refresh"]>>>["agent"];
 const DAY = 86400000;
 export function resetFor(quota: Quota, model: string | null, now: number) {
-  const windows = quota.windows.filter(w => !w.scope || !model || model.toLowerCase().includes(w.scope.toLowerCase()) ||
-    !/opus|sonnet|haiku|gpt|review|spark|image/i.test(w.scope));
+  const windows = applicableQuotaWindows(quota, model);
   const blocked = windows.filter(w => w.usedPercent >= 100);
   const next = windows.filter(w => (w.durationMinutes === 300 || w.durationMinutes === 10080) && w.resetsAt && Date.parse(w.resetsAt) > now)
     .sort((a, b) => Date.parse(a.resetsAt!) - Date.parse(b.resetsAt!))[0];
@@ -138,7 +137,7 @@ export class ScheduleManager {
       await this.accounts.store.update(s => { s.schedules.jobs[current.id].retryAfterSend = false; });
       const c = await this.context(current.agentId).catch(() => null);
       if (c && c.state.schedules.automatic[current.agentId] && c.agent.lastUserMessageAt === current.retryUserMessageAt)
-        await this.reserveAutomatic(current.agentId, false);
+        await this.reserveAutomatic(current.agentId);
     }
   }
   async cancelAgent(id: string, reason: string, automaticOnly = false) {
@@ -173,6 +172,9 @@ export class ScheduleManager {
     const c = await this.context(id);
     if (this.disposed || !c.state.schedules.automatic[id] || c.agent.activeTurn || !["idle", "error"].includes(c.agent.status) ||
       Object.values(c.state.schedules.jobs).some(j => j.agentId === id && (activeSchedule(j) || j.status === "attention"))) return;
+    const finished = c.state.usage.finished[id], sessionId = c.agent.persistence?.sessionId;
+    // A rewind forks a new native session; its copied old quota reply is not a new failed turn.
+    if (finished && sessionId && !finished.includes(`:${sessionId}:`)) return;
     const endedAt = Date.parse(c.agent.attentionTimestamp ?? c.agent.updatedAt ?? c.agent.lastUserMessageAt ?? "");
     if (!Number.isFinite(endedAt) || this.now() - endedAt > DAY) return;
     const page = await this.paseo!.agents.ref(id).timeline.refetch({ direction: "tail", projection: "canonical", limit: 100 });
@@ -187,8 +189,8 @@ export class ScheduleManager {
   async turnEnded(id: string, event: Parameters<typeof isUsageLimitFailure>[0], turnId: string | null) {
     await this.wakeAgent(id);
     if (!this.supported || !this.paseo || !isUsageLimitFailure(event)) { void this.kick(); return; }
-    const state = await this.accounts.store.read(), rotation = state.rotations[id];
-    if (!state.schedules.automatic[id] || rotation && ["checking", "switching", "sending", "continued"].includes(rotation.phase)) return;
+    const state = await this.accounts.store.read();
+    if (!state.schedules.automatic[id]) return;
     const key = state.usage.finished[id] ?? `${state.bindings[id]?.generation ?? ""}:${turnId ?? JSON.stringify(event.outcome)}`;
     const first = await this.accounts.store.update(s => {
       if (s.schedules.lastFailures[id] === key) return false;
@@ -202,13 +204,13 @@ export class ScheduleManager {
       await this.accounts.store.update(s => { const j = s.schedules.jobs[previous.id]; j.retryAfterSend = true; j.retryUserMessageAt = c.agent.lastUserMessageAt; });
       return;
     }
-    await this.reserveAutomatic(id, event.outcome.kind === "completed");
+    await this.reserveAutomatic(id);
     void this.kick();
   }
-  private async reserveAutomatic(id: string, confirmQuota: boolean) {
+  private async reserveAutomatic(id: string) {
     try {
       const c = await this.context(id), quota = await c.adapter.quota(c.home, c.accountId === null), reset = resetFor(quota, modelOf(c.agent), this.now());
-      if (confirmQuota && !reset.blocked) return;
+      if (quota.status !== "available" || quota.error) throw new Error("quota-pending");
       if (reset.at) await this.save(id, "Continue", reset.at, "automatic", undefined, c.agent.lastUserMessageAt);
       else await this.save(id, "Continue", this.iso(), "automatic", "초기화 시각을 확인하지 못했습니다. 실행 시간을 직접 지정하세요.", c.agent.lastUserMessageAt);
     } catch {
@@ -275,7 +277,7 @@ export class ScheduleManager {
       if (job.identity && auth.identity !== job.identity) { await this.mark(job, "canceled", "로그인된 실제 계정이 변경되어 예약을 취소했습니다."); return; }
       const quota = await c.adapter.quota(c.home, c.accountId === null);
       if (quota.status === "auth-required") { await this.mark(job, "attention", "계정 인증을 확인한 후 예약을 다시 지정하세요."); return; }
-      if (quota.status === "error" || quota.status === "loading") throw new Error("quota-pending");
+      if (quota.status !== "available" || quota.error || !applicableQuotaWindows(quota, modelOf(c.agent)).length) throw new Error("quota-pending");
       const reset = resetFor(quota, modelOf(c.agent), this.now());
       if (reset.blocked) {
         if (reset.stale && this.now() - Date.parse(job.dueAt) < 300000) {
@@ -283,6 +285,7 @@ export class ScheduleManager {
         }
         await this.mark(job, reset.at ? "waiting" : "attention", reset.reason, reset.at ? { dueAt: reset.at, nextAttemptAt: null } : {}); return;
       }
+      if (!hasRemainingQuota(quota, modelOf(c.agent))) throw new Error("quota-pending");
       const claimed = await this.accounts.store.update(s => {
         const current = s.schedules.jobs[job.id];
         if (this.disposed || current?.status !== "waiting" || current.revision !== job.revision || current.messageId !== job.messageId) return false;

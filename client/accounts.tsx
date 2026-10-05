@@ -220,7 +220,7 @@ export function AccountsSurface({ theme, layout, host, initialAgentId }: PluginS
               onPress={() => { mutation.reset(); setLabel(""); setAdding(harness); }}>계정 추가</Button>
           </ServiceHeader>
           <SettingsSwitch label="사용량 소진 시 자동 계정 전환" value={data.rotation[harness]} disabled={busy}
-            hint="같은 하네스의 다음 로그인 계정으로 전환해 중단된 작업을 이어갑니다. 기본 계정은 유지하며 리셋권을 사용하지 않습니다."
+            hint="남은 한도가 확인된 같은 하네스 계정으로만 전환해 중단된 작업을 이어갑니다."
             onValueChange={enabled => mutation.mutate({ action: "set-rotation", harness, enabled })} />
           {data.agents.filter(agent => agent.harness === harness && agent.rotation).map(agent => <View key={agent.id} style={{ gap: 8 }}>
             <Text accessibilityLiveRegion="polite" style={detail}>{agent.title} · {agent.rotation!.message}</Text>

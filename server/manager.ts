@@ -8,8 +8,9 @@ import type { PluginHandlerContext, PluginSessionOpenRequest, PluginLifecycleEve
 import { ActionSchema, HarnessSchema, emptyTokens, type Account, type Action, type Harness, type Snapshot, type State, type Metrics, type UsageCounter, type AccountSession, type Quota, type ResetOutcome, ResetOutcomeSchema, SessionSchema } from "../shared/accounts.js";
 import { createAdapters, type HarnessAdapter } from "./adapters.js";
 import { Store, privateDirectory, AccountError } from "./store.js";
-import { QuotaCache, QuotaError, unavailableQuota, emptyCounter } from "./usage.js";
+import { QuotaCache, QuotaError, unavailableQuota, emptyCounter, hasRemainingQuota } from "./usage.js";
 import { nativeSessions } from "./sessions.js";
+import { repairClaudeFork } from "./profile-history.js";
 
 type PaseoApi = PluginHandlerContext["paseo"];
 const execute = promisify(execFile);
@@ -196,7 +197,8 @@ export class AccountManager {
           override: owns(state.overrides, agent.id) ? state.overrides[agent.id] ?? "system" : "inherit" as const,
           desiredAccountId: selectedAccount(state, harness, agent.id),
           currentAccountId: state.bindings[agent.id]?.accountId ?? null,
-          pending: owns(state.pending, agent.id), error: state.pending[agent.id]?.error ?? null,
+          pending: owns(state.pending, agent.id), error: state.pending[agent.id]?.error ??
+            (state.historyRecovery[agent.id]?.sessionId === agent.persistence?.sessionId && state.historyRecovery[agent.id]?.status === "blocked" ? state.historyRecovery[agent.id].message : null),
           rotation: state.rotations[agent.id] ? { phase: state.rotations[agent.id].phase,
             message: state.rotations[agent.id].message, updatedAt: state.rotations[agent.id].updatedAt } : null,
         }];
@@ -613,7 +615,7 @@ export class AccountManager {
     this.restarting.add(id);
     try {
       const snapshot = await paseo.agents.ref(id).refresh();
-      if (!snapshot || snapshot.agent.archivedAt || !["idle", "error"].includes(snapshot.agent.status) || snapshot.agent.activeTurn) return;
+      if (!snapshot || snapshot.agent.archivedAt || !["idle", "error"].includes(snapshot.agent.status) || snapshot.agent.activeTurn || snapshot.agent.pendingPermissions?.length) return;
       await this.restart(id);
     } catch (error) {
       await this.store.update(state => { state.pending[id] = { ...state.pending[id], error: this.publicError(error) }; });
@@ -641,7 +643,10 @@ export class AccountManager {
       const snapshot = (request.reason === "create" || request.reason === "import") ? null : await paseo.agents.ref(request.agentId).refresh();
       const sessionId = snapshot?.agent.persistence?.sessionId ?? binding?.sessionId ?? null;
       const source = binding?.home ?? request.env[adapter.homeVariable] ?? adapter.systemHome;
+      const claudeId = sessionId && /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(sessionId);
+      if (harness === "claude" && claudeId && resolve(source) !== resolve(home)) await repairClaudeFork(source, adapter.systemHome, sessionId!, join(this.store.root, "history-recovery"));
       if (sessionId && resolve(source) !== resolve(home)) await adapter.transferHistory(source, home, sessionId);
+      if (harness === "claude" && account && claudeId) await repairClaudeFork(home, adapter.systemHome, sessionId!, join(this.store.root, "history-recovery"));
       const auth = await adapter.status(home, !account);
       let baseline = emptyCounter();
       if (request.reason === "import" && !sessionId) baseline.complete = false;
@@ -702,7 +707,7 @@ export class AccountManager {
       });
     });
   }
-  endTurn(id: string, turnId: string | null, paseo: PaseoApi, event?: TurnEnd) {
+  endTurn(id: string, turnId: string | null, paseo: PaseoApi, event?: TurnEnd, beforeRotation?: () => Promise<void>) {
     let rotationNeeded = false;
     return this.serialTurn(id, async () => {
       await this.initialize();
@@ -740,6 +745,7 @@ export class AccountManager {
       });
       if (event && sessionId) rotationNeeded = await this.prepareRotation(id, active, sessionId, event, snapshot?.agent.lastUserMessageAt ?? null);
     }).then(async () => {
+      await beforeRotation?.();
       if (rotationNeeded) await this.driveRotation(id, paseo);
       else await this.applyPending(id, paseo);
     });
@@ -780,6 +786,18 @@ export class AccountManager {
   private async rotationMessage(id: string, phase: State["rotations"][string]["phase"], message: string) {
     await this.store.update(state => { const job = state.rotations[id]; if (phase === "stopped") { stopRotation(state, id, message); return; } if (job) { job.phase = phase; job.message = message; job.updatedAt = new Date().toISOString(); } });
   }
+  private async rotationAccountReady(harness: Harness, accountId: string | null, identity: string, model: string | null) {
+    try {
+      const state = await this.store.read(), account = accountId ? state.accounts.find(a => a.id === accountId && a.harness === harness) : null;
+      if (accountId && !account || this.isAuthenticating(harness, accountId)) return false;
+      const adapter = this.adapters[harness], home = account ? this.profile(account) : adapter.systemHome;
+      const auth = await adapter.status(home, account === null);
+      if (!auth.signedIn || auth.identity !== identity) return false;
+      const quota = await adapter.quota(home, account === null);
+      this.quotas.put(`${this.row(harness, accountId)}:${identity}`, quota);
+      return hasRemainingQuota(quota, model);
+    } catch { return false; }
+  }
   async driveRotation(id: string, paseo: PaseoApi) {
     if (this.disposed || this.rotating.has(id)) return;
     this.rotating.add(id);
@@ -814,11 +832,9 @@ export class AccountManager {
           try {
             const auth = await adapter.status(home, account === null);
             if (!auth.signedIn || !auth.identity || job.triedIdentities.includes(auth.identity)) continue;
-            try {
-              const quota = await adapter.quota(home, account === null);
-              this.quotas.put(`${row}:${auth.identity}`, quota);
-              if (quota.status === "auth-required" || quota.windows.some(window => window.usedPercent >= 100 && (!window.resetsAt || Date.parse(window.resetsAt) > Date.now()))) continue;
-            } catch (error) { if (error instanceof QuotaError && error.status === "auth-required") continue; }
+            const quota = await adapter.quota(home, account === null);
+            this.quotas.put(`${row}:${auth.identity}`, quota);
+            if (!hasRemainingQuota(quota, current.agent.model ?? null)) continue;
             chosen = { id: accountId, identity: auth.identity, label: account?.label ?? "시스템 계정" }; break;
           } catch { /* An unavailable or unsafe profile is never selected. */ }
         }
@@ -827,7 +843,10 @@ export class AccountManager {
           !["idle", "error"].includes(beforeSwitch.agent.status) || beforeSwitch.agent.lastUserMessageAt !== job.lastUserMessageAt) {
           await this.rotationMessage(id, "stopped", "새 작업 또는 입력을 확인해 자동 전환을 중단했습니다."); return;
         }
-        if (!chosen) { await this.rotationMessage(id, "stopped", "같은 하네스에 사용할 수 있는 다음 계정이 없습니다. 계정을 추가하거나 한도 초기화를 기다리세요."); return; }
+        if (!chosen) { await this.rotationMessage(id, "stopped", "같은 하네스에서 남은 한도가 확인된 다음 계정이 없습니다. 현재 계정의 초기화를 기다리세요."); return; }
+        if (!await this.rotationAccountReady(job.harness, chosen.id, chosen.identity, beforeSwitch.agent.model ?? null)) {
+          await this.rotationMessage(id, "stopped", "다음 계정의 남은 한도를 다시 확인하지 못해 자동 전환을 중단했습니다."); return;
+        }
         await this.store.update(next => {
           const job = next.rotations[id];
           if (!job || job.failedKey !== expectedKey || job.phase !== "checking" || !next.rotation[job.harness] || owns(next.pending, id)) return;
@@ -842,17 +861,20 @@ export class AccountManager {
       state = await this.store.read(); job = state.rotations[id];
       if (job.failedKey !== expectedKey || !state.rotation[job.harness] || !["switching", "sending"].includes(job.phase)) return;
       const refreshed = await paseo.agents.ref(id).refresh(), binding = state.bindings[id];
-      if (owns(state.pending, id) || binding?.accountId !== job.targetAccountId || binding.sessionId !== job.sessionId)
+      if (owns(state.pending, id) || binding?.accountId !== job.targetAccountId || binding.harness !== job.harness || binding.sessionId !== job.sessionId)
         throw new AccountError("계정 전환을 완료하지 못했습니다. 대화 기록을 보존했습니다. 자동 전환을 다시 시도하세요.");
       if (!refreshed || refreshed.agent.archivedAt || !["idle", "error"].includes(refreshed.agent.status) || refreshed.agent.activeTurn || refreshed.agent.pendingPermissions?.length ||
         refreshed.agent.persistence?.sessionId !== job.sessionId || refreshed.agent.lastUserMessageAt !== job.lastUserMessageAt) {
         await this.rotationMessage(id, "stopped", "새 작업 또는 입력을 확인해 자동 재개를 중단했습니다."); return;
       }
+      if (!await this.rotationAccountReady(job.harness, job.targetAccountId, job.triedIdentities.at(-1) ?? "", refreshed.agent.model ?? null)) {
+        await this.rotationMessage(id, "stopped", "전환된 계정의 남은 한도를 확인하지 못해 재개 메시지를 보내지 않았습니다."); return;
+      }
       await this.rotationMessage(id, "sending", "계정을 전환했습니다. 이전 대화에서 중단된 작업을 재개하고 있습니다.");
       // Reuse the persisted message ID: Paseo's durable delivery receipt prevents duplicate continuation prompts.
       const confirmed = await this.store.read();
       if (!confirmed.rotation[job.harness] || confirmed.rotations[id]?.phase !== "sending" || confirmed.rotations[id]?.failedKey !== expectedKey) return;
-      const options = { messageId: job.messageId, activeTurnBehavior: "steer" as const };
+      const options = { messageId: job.messageId, sendGuard: { lastUserMessageAt: job.lastUserMessageAt, provider: job.harness, sessionId: job.sessionId } };
       await paseo.agents.ref(id).send(RESUME_PROMPT, options);
       await this.store.update(next => { const job = next.rotations[id]; if (job?.failedKey === expectedKey && job.phase === "sending") {
         job.phase = "continued"; job.message = "같은 하네스의 다음 계정에서 작업을 이어서 실행 중입니다."; job.updatedAt = new Date().toISOString();

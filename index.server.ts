@@ -3,6 +3,7 @@ import { ExtensionManager } from "./server/extensions.js";
 import { inventoryExtensions, commonExtensions, previewExtensions, applyExtensions, mutateExtension, extensionDetails, extensionJobs } from "./shared/extensions.js";
 import { AccountManager } from "./server/manager.js";
 import { ScheduleManager } from "./server/schedules.js";
+import { ProfileHistoryGuard } from "./server/profile-history.js";
 import { listSchedules, changeSchedule } from "./shared/schedules.js";
 import { listAccounts, changeAccount, listSessions, importAccountSession, prepareReset, consumeReset } from "./shared/accounts.js";
 
@@ -10,8 +11,12 @@ export default function contribute(server: PluginServerContext) {
   const manager = new AccountManager();
   const extensions = new ExtensionManager(manager);
   const schedules = new ScheduleManager(manager);
+  const history = new ProfileHistoryGuard(manager);
   const startup = server as PluginServerContext & { paseo?: Parameters<ScheduleManager["start"]>[0]; capabilities?: { guardedAgentMessages?: number } };
-  if (startup.paseo) schedules.start(startup.paseo, startup.capabilities?.guardedAgentMessages === 1);
+  if (startup.paseo) {
+    schedules.start(startup.paseo, startup.capabilities?.guardedAgentMessages === 1);
+    void history.start(startup.paseo).catch(() => {});
+  }
   const safe = async <T,>(operation: Promise<T>) => {
     try { return await operation; } catch (error) { throw new Error(manager.publicError(error)); }
   };
@@ -55,11 +60,10 @@ export default function contribute(server: PluginServerContext) {
   })()));
   server.on("agent.turn_started", ({ agent, turnId }, { paseo }) => safe((async () => { await manager.beginTurn(agent.id, turnId, paseo); await schedules.turnStarted(agent.id); })()));
   server.on("agent.turn_ended", ({ agent, turnId, outcome, timeline }, { paseo }) => safe((async () => {
-    await manager.endTurn(agent.id, turnId, paseo, { outcome, timeline });
-    await schedules.turnEnded(agent.id, { outcome, timeline }, turnId);
+    await manager.endTurn(agent.id, turnId, paseo, { outcome, timeline }, () => schedules.turnEnded(agent.id, { outcome, timeline }, turnId));
   })()));
   server.on("agent.archived", ({ agent }, { paseo }) => { schedules.connect(paseo); return safe(schedules.cancelAgent(agent.id, "세션이 보관되어 예약을 취소했습니다.")); });
   server.on("agent.permission_resolved", ({ agent }) => safe(schedules.wakeAgent(agent.id)));
   server.on("agent.created", ({ agent }, { paseo }) => safe(manager.prepareCreatedAgent(agent.id, paseo)));
-  return () => { schedules.dispose(); extensions.dispose(); manager.dispose(); };
+  return () => { history.dispose(); schedules.dispose(); extensions.dispose(); manager.dispose(); };
 }

@@ -14,6 +14,15 @@ export const unavailableQuota = (error: string | null = null): Quota =>
 export class QuotaError extends Error {
   constructor(public status: "auth-required" | "error" | "unavailable", message: string, public retryAfterMs = 60000) { super(message); }
 }
+export function applicableQuotaWindows(quota: Quota, model: string | null) {
+  return quota.windows.filter(w => !w.scope || !model || model.toLowerCase().includes(w.scope.toLowerCase()) ||
+    !/opus|sonnet|haiku|gpt|review|spark|image/i.test(w.scope));
+}
+export function hasRemainingQuota(quota: Quota, model: string | null) {
+  const windows = applicableQuotaWindows(quota, model);
+  return quota.status === "available" && !quota.error && windows.length > 0 &&
+    windows.every(w => Number.isFinite(w.usedPercent) && w.usedPercent >= 0 && w.usedPercent < 100);
+}
 
 /** Only account metadata RPCs; no threads, prompts, OAuth start, or external token injection. */
 async function codexAccount<T>(command: string, env: NodeJS.ProcessEnv, signal: AbortSignal | undefined, credentialArgs: string[],

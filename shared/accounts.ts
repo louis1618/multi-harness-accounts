@@ -68,6 +68,7 @@ const RotationPhaseSchema = z.enum(["checking", "switching", "sending", "continu
 export const StateSchema = z.object({
   version: z.literal(3).default(3),
   schedules: ScheduleStateSchema,
+  historyRecovery: z.record(AgentIdSchema, z.object({ sessionId: z.string(), status: z.enum(["recovered", "blocked"]), message: z.string(), updatedAt: z.string().datetime() }).strict()).default({}),
   accounts: z.array(AccountSchema).default([]),
   defaults: z.object({ codex: AccountIdSchema.nullable(), claude: AccountIdSchema.nullable() })
     .default({ codex: null, claude: null }),
