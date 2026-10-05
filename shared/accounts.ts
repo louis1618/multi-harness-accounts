@@ -33,6 +33,9 @@ export const QuotaSchema = z.object({
   status: z.enum(["loading", "available", "unavailable", "auth-required", "error"]),
   plan: z.string().nullable(), fetchedAt: z.string().datetime().nullable(), error: z.string().nullable(),
   retryAt: z.string().datetime().nullable().optional(),
+  attemptedAt: z.string().datetime().nullable().optional(),
+  retrySource: z.enum(["server", "local"]).nullable().optional(),
+  failureCode: z.enum(["rate-limited", "network", "response", "profile", "auth", "unknown"]).nullable().optional(),
   windows: z.array(z.object({
     id: z.string(), label: z.string(), usedPercent: z.number().min(0).max(100),
     durationMinutes: z.number().positive(), resetsAt: z.string().datetime().nullable(),

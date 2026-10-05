@@ -3,8 +3,9 @@ import { spawn } from "node:child_process";
 import { readFile, readdir, lstat, realpath } from "node:fs/promises";
 import { lock } from "proper-lockfile";
 import { createInterface } from "node:readline";
+import { ZodError } from "zod";
 import { join } from "node:path";
-import { atomicWrite } from "./store.js";
+import { atomicWrite, AccountError } from "./store.js";
 import { emptyTokens, QuotaSchema, type Harness, type Quota, type ResetOutcome, type TokenTotals, type UsageCounter } from "../shared/accounts.js";
 
 export const emptyCounter = (): UsageCounter => ({ totals: emptyTokens(), observed: false, complete: true });
@@ -12,7 +13,8 @@ const number = (value: unknown): value is number => typeof value === "number" &&
 export const unavailableQuota = (error: string | null = null): Quota =>
   ({ status: "unavailable", windows: [], plan: null, fetchedAt: null, error, resetCredits: null });
 export class QuotaError extends Error {
-  constructor(public status: "auth-required" | "error" | "unavailable", message: string, public retryAfterMs = 60000) { super(message); }
+  constructor(public status: "auth-required" | "error" | "unavailable", message: string, public retryAfterMs = 60000,
+    public info: { kind?: Quota["failureCode"]; retrySource?: "server" | "local" } = {}) { super(message); }
 }
 export function applicableQuotaWindows(quota: Quota, model: string | null) {
   return quota.windows.filter(w => !w.scope || !model || model.toLowerCase().includes(w.scope.toLowerCase()) ||
@@ -284,7 +286,7 @@ async function claudeAccount(home: string, fetchApi: typeof fetch, signal?: Abor
       headers: { Authorization: `Bearer ${oauth.accessToken}`, Accept: "application/json", "anthropic-beta": "oauth-2025-04-20",
         "User-Agent": "claude-cli/2.1.285 (external, cli)", ...(body ? { "Content-Type": "application/json" } : {}) },
       ...(body ? { body: JSON.stringify(body) } : {}),
-    }); } catch { throw new QuotaError("error", body ? "Claude 리셋 결과를 확인하지 못했습니다." : "Claude 한도를 조회하지 못했습니다. 연결을 확인하고 새로고침하세요."); }
+    }); } catch { throw new QuotaError("error", body ? "Claude 리셋 결과를 확인하지 못했습니다." : "Claude 한도를 조회하지 못했습니다. 연결을 확인하고 새로고침하세요.", 60000, { kind: "network" }); }
     const revoked = response.status === 403 && /OAuth token has been revoked/i.test(await response.clone().text());
     if ((response.status === 401 || revoked) && !body && !retried) {
       const previous = oauth.accessToken;
@@ -297,7 +299,8 @@ async function claudeAccount(home: string, fetchApi: typeof fetch, signal?: Abor
     if (response.status === 429) {
       const header = response.headers.get("retry-after"), seconds = header === null ? NaN : Number(header);
       const retry = Number.isFinite(seconds) ? seconds * 1000 : Date.parse(header ?? "") - Date.now();
-      throw new QuotaError("error", "한도 조회 요청이 많습니다. 잠시 후 다시 시도하세요.", Math.max(60000, Number.isFinite(retry) ? retry : 60000));
+      throw new QuotaError("error", "Claude 서버가 사용량 조회를 제한하고 있습니다(HTTP 429).", Math.max(60000, Number.isFinite(retry) ? retry : 60000),
+        { kind: "rate-limited", retrySource: Number.isFinite(retry) && retry >= 60000 ? "server" : "local" });
     }
     if (!response.ok) throw new QuotaError("error", "Claude 응답을 확인하지 못했습니다. 잠시 후 다시 조회하세요.");
     try { return await response.json(); } catch { throw new QuotaError("error", "Claude 응답을 읽지 못했습니다."); }
@@ -377,12 +380,16 @@ export class QuotaCache {
     const current = entry;
     const operation = this.queue.then(async () => {
       if (this.controller.signal.aborted) { current.pending = false; return; }
+      const attemptedAt = new Date(this.now()).toISOString();
       try {
-        current.value = { ...QuotaSchema.parse(await load(this.controller.signal)), retryAt: null };
+        current.value = { ...QuotaSchema.parse(await load(this.controller.signal)), retryAt: null, retrySource: null, failureCode: null, attemptedAt };
         current.nextAt = this.now() + 5 * 60 * 1000;
       } catch (error) {
         const cause = error instanceof QuotaError ? error : new QuotaError("error", "한도를 조회하지 못했습니다. 잠시 후 새로고침하세요.");
-        current.value = { ...current.value, status: cause.status, error: /^[가-힣]/.test(cause.message) ? cause.message : "한도를 조회하지 못했습니다. 잠시 후 다시 조회하세요." };
+        const failureCode = cause.info.kind ?? (cause.status === "auth-required" ? "auth" : error instanceof ZodError ? "response" : error instanceof AccountError ? "profile" : "unknown");
+        const message = failureCode === "response" ? "한도 응답 형식을 읽지 못했습니다." : failureCode === "profile" ? "계정 프로필을 확인하지 못했습니다." :
+          /^[가-힣]/.test(cause.message) ? cause.message : "한도를 조회하지 못했습니다. 잠시 후 다시 조회하세요.";
+        current.value = { ...current.value, status: cause.status, error: message, failureCode, retrySource: cause.info.retrySource ?? "local", attemptedAt };
         current.nextAt = this.now() + cause.retryAfterMs;
         current.forceAt = Math.max(current.forceAt, current.nextAt);
         current.value.retryAt = new Date(current.nextAt).toISOString();
@@ -398,7 +405,7 @@ export class QuotaCache {
     await entry.operation;
     const value = entry.value;
     if (value.status !== "available" || value.error) throw new QuotaError(value.status === "auth-required" || value.status === "unavailable" ? value.status : "error",
-      value.error ?? "한도를 확인하지 못했습니다. 잠시 후 다시 조회하세요.", Math.max(0, entry.nextAt - this.now()));
+      value.error ?? "한도를 확인하지 못했습니다. 잠시 후 다시 조회하세요.", Math.max(0, entry.nextAt - this.now()), { kind: value.failureCode, retrySource: value.retrySource ?? "local" });
     return value;
   }
   async settled() { await this.queue; await this.writes; }

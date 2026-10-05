@@ -375,3 +375,38 @@ test('fresh safety reads share in-flight queries and keep upstream backoff despi
   for (let i = 0; i < 10; i++) { cache.get('profile', load, true); await assert.rejects(cache.read('profile', load)); }
   assert.equal(calls, 2); assert.ok(!JSON.stringify(cache.get('profile', load)).includes('private-token-secret')); cache.stop();
 });
+
+test('server retry deadlines never slide when the UI polls, force-refreshes, or a safety read is blocked', async () => {
+ let now=1000,calls=0;const cache=new QuotaCache(()=>now);
+ const load=async()=>{calls++;throw new QuotaError('error','Claude 서버가 사용량 조회를 제한하고 있습니다(HTTP 429).',3600000,{kind:'rate-limited',retrySource:'server'});};
+ cache.get('profile',load);await cache.settled();const initial=cache.get('profile',load);
+ assert.equal(initial.failureCode,'rate-limited');assert.equal(initial.retrySource,'server');assert.equal(initial.attemptedAt,new Date(1000).toISOString());
+ for(let i=0;i<24;i++){now+=120000;assert.equal(cache.get('profile',load,i%2===0).retryAt,initial.retryAt);await assert.rejects(cache.read('profile',load),e=>e.info.retrySource==='server');}
+ assert.equal(calls,1);assert.equal(cache.get('profile',load).attemptedAt,initial.attemptedAt);
+ now=3601000;cache.get('profile',load);await cache.settled();const second=cache.get('profile',load);
+ assert.equal(calls,2);assert.notEqual(second.attemptedAt,initial.attemptedAt);assert.equal(second.retryAt,new Date(now+3600000).toISOString());cache.stop();
+});
+test('native 429 diagnostics separate upstream Retry-After from local fallback without exposing credentials',async t=>{
+ const root=await temporary(t);await writeFile(join(root,'.credentials.json'),JSON.stringify({claudeAiOauth:{accessToken:'private-secret'}}));
+ for(const header of ['3600','0'])await assert.rejects(claudeQuota(root,async()=>new Response('',{status:429,headers:{'retry-after':header}})),e=>{
+  assert.equal(e.info.kind,'rate-limited');assert.equal(e.info.retrySource,header==='3600'?'server':'local');assert.match(e.message,/HTTP 429/);assert.ok(!e.message.includes('private-secret'));return true;
+ });
+});
+test('schema failures are identifiable without serializing raw validation data',async()=>{
+ const cache=new QuotaCache(()=>1000);cache.get('profile',async()=>({status:'private-token-secret'}));await cache.settled();
+ const q=cache.get('profile',async()=>{throw Error('unused');});assert.equal(q.failureCode,'response');assert.equal(q.retrySource,'local');assert.match(q.error,/응답 형식/);assert.ok(!JSON.stringify(q).includes('private-token-secret'));cache.stop();
+});
+
+test('managed Claude OAuth status reads local identity without starting CLI and respects config auth overrides',async t=>{
+ const root=await temporary(t),marker=join(root,'cli-started'),command=join(root,'claude-status');
+ await writeFile(command,`#!/usr/bin/env node\nrequire('node:fs').appendFileSync(${JSON.stringify(marker)},'called\\n');console.log(JSON.stringify({loggedIn:false}));\n`,{mode:0o700});
+ const credential=JSON.stringify({claudeAiOauth:{accessToken:'private-secret',expiresAt:Date.now()+3600000,refreshToken:'private-refresh'}});
+ const info={accountUuid:randomUUID(),organizationUuid:randomUUID(),emailAddress:'local@example.test'};
+ await writeFile(join(root,'.credentials.json'),credential);await writeFile(join(root,'.claude.json'),JSON.stringify({oauthAccount:info}));await writeFile(join(root,'settings.json'),'{}');
+ const adapter=createAdapters({claude:command}).claude;
+ const first=await adapter.status(root);assert.equal(first.signedIn,true);assert.equal(first.email,info.emailAddress);
+ await assert.rejects(readFile(marker),e=>e.code==='ENOENT');assert.ok(!JSON.stringify(first).includes('private-'));
+ info.accountUuid=randomUUID();await writeFile(join(root,'.claude.json'),JSON.stringify({oauthAccount:info}));assert.notEqual((await adapter.status(root)).identity,first.identity);
+ await writeFile(join(root,'settings.json'),JSON.stringify({env:{ANTHROPIC_API_KEY:'fixture-key'}}));assert.equal((await adapter.status(root)).signedIn,false);assert.equal(await readFile(marker,'utf8'),'called\n');
+ assert.equal(await readFile(join(root,'.credentials.json'),'utf8'),credential);
+});

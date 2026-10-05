@@ -56,6 +56,7 @@ export class ScheduleManager {
     const state = await this.accounts.store.read();
     let defaultAt: string | null = null, resetReason: string | null = null, error: string | null = null;
     let retryAt: string | null = null, quotaFetchedAt: string | null = null;
+    let attemptedAt: string | null = null, retrySource: "server" | "local" | null = null;
     let context: { harness: "codex" | "claude"; accountLabel: string } | null = null;
     if (agentId && this.paseo) try {
       const c = await this.context(agentId);
@@ -63,6 +64,7 @@ export class ScheduleManager {
       const quota = await this.accounts.quota(c.harness, c.accountId, { home: c.home, mode: refresh ? "refresh" : "cached" });
       const reset = resetFor(quota, modelOf(c.agent), this.now()); defaultAt = reset.at;
       retryAt = quota.retryAt ?? null; quotaFetchedAt = quota.fetchedAt;
+      attemptedAt = quota.attemptedAt ?? null; retrySource = quota.retrySource ?? null;
       if (quota.status === "loading") resetReason = "초기화 시각 조회 중…";
       else if (quota.status !== "available" || quota.error) {
         error = quota.error ?? "한도를 조회하지 못했습니다. 잠시 후 다시 조회하세요.";
@@ -72,7 +74,7 @@ export class ScheduleManager {
     return { supported: this.supported, jobs: Object.values(state.schedules.jobs).filter(j => !agentId || j.agentId === agentId)
       .sort((a, b) => Number(activeSchedule(b)) - Number(activeSchedule(a)) || (activeSchedule(a) ? a.dueAt.localeCompare(b.dueAt) : b.updatedAt.localeCompare(a.updatedAt))).map(scheduleCard),
       automatic: agentId ? state.schedules.automatic[agentId] ?? false : false, defaultAt, resetReason, context,
-      timezone: Intl.DateTimeFormat().resolvedOptions().timeZone, error, retryAt, quotaFetchedAt };
+      timezone: Intl.DateTimeFormat().resolvedOptions().timeZone, error, retryAt, quotaFetchedAt, attemptedAt, retrySource };
   }
   async change(input: { action: "save"; agentId: string; message: string; dueAt: string } | { action: "cancel"; id: string } | { action: "automatic"; agentId: string; enabled: boolean }) {
     if (input.action === "cancel") {

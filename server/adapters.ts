@@ -157,6 +157,28 @@ export function createAdapters(commands: Partial<Record<Harness, string>> = {}, 
             throw new AccountError("Codex 인증 정보를 읽지 못했습니다. 다시 로그인하세요.");
           }
         }
+        if (!native) {
+          // OAuth profiles already contain identity and credentials. `claude auth status`
+          // starts the full CLI and performs network work, even for a read-only UI poll.
+          try {
+            const credentialPath = join(home, ".credentials.json"), metadataPath = join(home, ".claude.json");
+            const stats = await Promise.all([lstat(credentialPath), lstat(metadataPath)]);
+            if (stats.every(stat => stat.isFile() && !stat.isSymbolicLink() && stat.size <= 1024 * 1024)) {
+              const [credential, metadata, settings] = await Promise.all([
+                readFile(credentialPath, "utf8").then(JSON.parse), readFile(metadataPath, "utf8").then(JSON.parse),
+                readFile(join(home, "settings.json"), "utf8").then(JSON.parse).catch(() => ({})),
+              ]);
+              const oauth = credential.claudeAiOauth, account = metadata.oauthAccount;
+              const override = authVariables.claude.some(key => typeof settings.env?.[key] === "string" && settings.env[key]);
+              if (!override && typeof oauth?.accessToken === "string" && oauth.accessToken &&
+                (typeof oauth.expiresAt !== "number" || oauth.expiresAt > Date.now() || typeof oauth.refreshToken === "string" && oauth.refreshToken) &&
+                typeof account?.accountUuid === "string" && typeof account.organizationUuid === "string") {
+                return { signedIn: true, email: typeof account.emailAddress === "string" && account.emailAddress.length < 255 ? account.emailAddress : null,
+                  identity: identity(account.accountUuid, account.organizationUuid) };
+              }
+            }
+          } catch { /* Other auth stores and incomplete profiles still use the native status command. */ }
+        }
         try {
           const { stdout } = await execute(command, ["auth", "status", "--json"], {
             env: statusEnv, timeout: 10000, maxBuffer: 65536,

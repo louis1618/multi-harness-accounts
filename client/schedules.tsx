@@ -78,8 +78,10 @@ function ScheduleForm({ agentId, colors, close, onOverview }: { agentId: string;
       </Pressable>}
       {query.data?.error && <View style={{ gap: 6 }}>
         <Text accessibilityRole="alert" style={{ color: colors.statusWarning, lineHeight: 21 }}>{query.data.error}</Text>
+        {query.data.attemptedAt && <Text style={{ color: colors.foregroundMuted, fontSize: 13 }}>최근 조회 실패 · {dateLabel(query.data.attemptedAt)}</Text>}
         {query.data.quotaFetchedAt && <Text style={{ color: colors.foregroundMuted, fontSize: 13 }}>마지막 조회 · {dateLabel(query.data.quotaFetchedAt)}</Text>}
-        {query.data.retryAt && Date.parse(query.data.retryAt) > now && <Text style={{ color: colors.foregroundMuted, fontSize: 13 }}>자동 재조회 · {dateLabel(query.data.retryAt)} · {formatResetCountdown(query.data.retryAt, now)}</Text>}
+        {query.data.retryAt && Date.parse(query.data.retryAt) > now && <Text style={{ color: colors.foregroundMuted, fontSize: 13 }}>{query.data.retrySource === "server" ? "서버가 지정한 다음 조회 시도" : "다음 조회 시도"} · {dateLabel(query.data.retryAt)} · {formatResetCountdown(query.data.retryAt, now)}</Text>}
+        {query.data.retrySource === "server" && <Text style={{ color: colors.foregroundMuted, fontSize: 13, lineHeight: 20 }}>서버 제한이 계속되면 대기가 연장될 수 있습니다. 조회 성공 시 초기화 시각이 표시됩니다.</Text>}
         <Button colors={colors} icon="RefreshCw" disabled={refresh.isPending || query.isFetching || !!query.data.retryAt && Date.parse(query.data.retryAt) > now}
           onPress={() => refresh.mutate()}>한도 다시 조회</Button>
       </View>}

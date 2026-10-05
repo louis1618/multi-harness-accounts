@@ -37,7 +37,8 @@ export const listSchedules = defineRpc({ name: "accounts.schedules.list", input:
   output: z.object({ supported: z.boolean(), jobs: z.array(ScheduleCardSchema), automatic: z.boolean(),
     context: z.object({ harness: ScheduleCardSchema.shape.harness, accountLabel: z.string() }).strict().nullable().default(null),
     defaultAt: z.string().datetime().nullable(), resetReason: z.string().nullable(), timezone: z.string(), error: z.string().nullable(),
-    retryAt: z.string().datetime().nullable().default(null), quotaFetchedAt: z.string().datetime().nullable().default(null) }).strict() });
+    retryAt: z.string().datetime().nullable().default(null), quotaFetchedAt: z.string().datetime().nullable().default(null),
+    attemptedAt: z.string().datetime().nullable().default(null), retrySource: z.enum(["server", "local"]).nullable().default(null) }).strict() });
 export const changeSchedule = defineRpc({ name: "accounts.schedules.change", input: z.discriminatedUnion("action", [
   z.object({ action: z.literal("save"), agentId: AgentId, message: ScheduleCardSchema.shape.message, dueAt: z.string().datetime() }).strict(),
   z.object({ action: z.literal("cancel"), id: z.string().uuid() }).strict(),
