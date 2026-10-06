@@ -2,6 +2,7 @@ import { defineRpc } from "@getpaseo/plugin";
 import { z } from "zod";
 
 export const ScheduleStatus = z.enum(["waiting", "sending", "sent", "canceled", "attention"]);
+export const scheduleRetentionMs = 30 * 86400000;
 export const scheduleLabels: Record<z.infer<typeof ScheduleStatus>, string> = {
   waiting: "예약 중", sending: "전송 확인 중", sent: "전송 완료", canceled: "취소됨", attention: "확인 필요",
 };
@@ -10,6 +11,7 @@ export const ScheduleCardSchema = z.object({
   harness: z.enum(["codex", "claude"]), accountLabel: z.string(), message: z.string().trim().min(1).max(16000),
   dueAt: z.string().datetime(), status: ScheduleStatus, reason: z.string(),
   source: z.enum(["manual", "automatic"]), updatedAt: z.string().datetime(),
+  finishedAt: z.string().datetime().nullable().default(null),
   waitingFor: z.enum(["busy", "permissions", "quota"]).nullable().optional(),
 }).strict();
 export const ScheduleSchema = ScheduleCardSchema.extend({
@@ -22,15 +24,19 @@ export const ScheduleSchema = ScheduleCardSchema.extend({
 }).strict();
 export type Schedule = z.infer<typeof ScheduleSchema>;
 export type ScheduleCard = z.infer<typeof ScheduleCardSchema>;
+export const ScheduleTimelineSchema = z.union([ScheduleCardSchema, z.object({ id: z.string().uuid(), deleted: z.literal(true) }).strict()]);
+export type ScheduleTimeline = z.infer<typeof ScheduleTimelineSchema>;
 export const ScheduleStateSchema = z.object({
   jobs: z.record(z.string().uuid(), ScheduleSchema).default({}),
+  removed: z.record(z.string().uuid(), z.string().min(1).max(128)).default({}),
   automatic: z.record(z.string(), z.boolean()).default({}),
   lastFailures: z.record(z.string(), z.string()).default({}),
-}).strict().default({ jobs: {}, automatic: {}, lastFailures: {} });
+}).strict().default({ jobs: {}, removed: {}, automatic: {}, lastFailures: {} });
 export const activeSchedule = (job: Pick<Schedule, "status">) => job.status === "waiting" || job.status === "sending";
+export const finishedSchedule = (job: Pick<Schedule, "status">) => job.status === "sent" || job.status === "canceled";
 export const scheduleCard = (job: Schedule): ScheduleCard => ScheduleCardSchema.parse({
   id: job.id, agentId: job.agentId, title: job.title, harness: job.harness, accountLabel: job.accountLabel,
-  message: job.message, dueAt: job.dueAt, status: job.status, reason: job.reason, source: job.source, updatedAt: job.updatedAt, waitingFor: job.waitingFor,
+  message: job.message, dueAt: job.dueAt, status: job.status, reason: job.reason, source: job.source, updatedAt: job.updatedAt, finishedAt: job.finishedAt, waitingFor: job.waitingFor,
 });
 const AgentId = z.string().min(1).max(128).regex(/^[A-Za-z0-9_-]+$/);
 export const listSchedules = defineRpc({ name: "accounts.schedules.list", input: z.object({ agentId: AgentId.optional(), refresh: z.boolean().optional() }).strict(),
@@ -42,6 +48,7 @@ export const listSchedules = defineRpc({ name: "accounts.schedules.list", input:
 export const changeSchedule = defineRpc({ name: "accounts.schedules.change", input: z.discriminatedUnion("action", [
   z.object({ action: z.literal("save"), agentId: AgentId, message: ScheduleCardSchema.shape.message, dueAt: z.string().datetime() }).strict(),
   z.object({ action: z.literal("cancel"), id: z.string().uuid() }).strict(),
+  z.object({ action: z.literal("delete"), id: z.string().uuid() }).strict(),
   z.object({ action: z.literal("automatic"), agentId: AgentId, enabled: z.boolean() }).strict(),
 ]), output: z.object({ message: z.string() }).strict() });
 

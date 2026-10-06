@@ -1,7 +1,8 @@
 import { randomUUID } from "node:crypto";
+import type { RpcInput } from "@getpaseo/plugin";
 import type { PluginHandlerContext } from "@getpaseo/plugin/server";
 import { HarnessSchema, type Quota } from "../shared/accounts.js";
-import { activeSchedule, scheduleCard, type Schedule } from "../shared/schedules.js";
+import { activeSchedule, changeSchedule, finishedSchedule, scheduleCard, scheduleRetentionMs, type Schedule } from "../shared/schedules.js";
 import { AccountManager, selectedAccount, isUsageLimitFailure } from "./manager.js";
 import { AccountError } from "./store.js";
 import { QuotaError, applicableQuotaWindows, hasRemainingQuota } from "./usage.js";
@@ -33,7 +34,7 @@ export class ScheduleManager {
   constructor(readonly accounts: AccountManager, private now: () => number = Date.now) {}
   start(paseo: PaseoApi, supported: boolean) {
     this.paseo = paseo; this.supported = supported;
-    return supported ? this.restoreAutomatic().catch(() => {}).finally(() => { void this.kick(); }) : Promise.resolve();
+    return (supported ? this.restoreAutomatic().catch(() => {}) : Promise.resolve()).finally(() => { void this.kick(); });
   }
   connect(paseo: PaseoApi) { this.paseo ??= paseo; }
   private iso() { return new Date(this.now()).toISOString(); }
@@ -53,6 +54,7 @@ export class ScheduleManager {
     return { agent, state, binding, harness, accountId, adapter, home, accountLabel: account?.label ?? "시스템 계정" };
   }
   async list(agentId?: string, refresh = false) {
+    await this.pruneHistory();
     const state = await this.accounts.store.read();
     let defaultAt: string | null = null, resetReason: string | null = null, error: string | null = null;
     let retryAt: string | null = null, quotaFetchedAt: string | null = null;
@@ -76,8 +78,18 @@ export class ScheduleManager {
       automatic: agentId ? state.schedules.automatic[agentId] ?? false : false, defaultAt, resetReason, context,
       timezone: Intl.DateTimeFormat().resolvedOptions().timeZone, error, retryAt, quotaFetchedAt, attemptedAt, retrySource };
   }
-  async change(input: { action: "save"; agentId: string; message: string; dueAt: string } | { action: "cancel"; id: string } | { action: "automatic"; agentId: string; enabled: boolean }) {
-    if (input.action === "cancel") {
+  async change(input: RpcInput<typeof changeSchedule>) {
+    if (input.action === "delete") {
+      await this.accounts.store.update(s => {
+        const job = s.schedules.jobs[input.id];
+        if (!job) return;
+        if (!finishedSchedule(job)) throw new AccountError("활성 예약은 먼저 취소한 후 삭제하세요. 전송 확인 중인 예약은 결과를 기다리세요.");
+        s.schedules.removed[job.id] = job.agentId;
+        delete s.schedules.jobs[job.id];
+      });
+      await this.kick();
+      return { message: "예약 기록을 삭제했습니다. 이미 전송된 메시지와 대화는 유지됩니다." };
+    } else if (input.action === "cancel") {
       const job = (await this.accounts.store.read()).schedules.jobs[input.id];
       if (!job) throw new AccountError("예약을 찾지 못했습니다.");
       if (job.status === "sending") throw new AccountError("전송 결과를 확인 중입니다. 확인 후 변경하세요.");
@@ -119,7 +131,7 @@ export class ScheduleManager {
         sessionId: c.agent.persistence?.sessionId ?? null, lastUserMessageAt: c.agent.lastUserMessageAt ?? null,
         message: message.trim(), dueAt, source, status: attention || !auth.signedIn ? "attention" : "waiting", reason: attention ?? (!auth.signedIn ? "계정 인증을 확인한 후 예약 시간을 지정하세요." : "예약 시각에 작업 종료·한도를 확인한 후 전송합니다."),
         messageId: randomUUID(), revision: (previous?.revision ?? 0) + 1, createdAt: previous?.createdAt ?? at,
-        updatedAt: at, nextAttemptAt: null, timelineDirty: true, waitingFor: null, retryAfterSend: false, retryUserMessageAt: null,
+        updatedAt: at, finishedAt: null, nextAttemptAt: null, timelineDirty: true, waitingFor: null, retryAfterSend: false, retryUserMessageAt: null,
       };
       state.schedules.jobs[job.id] = job; return job;
     });
@@ -129,6 +141,8 @@ export class ScheduleManager {
   private async publish(job: Schedule) {
     if (!this.paseo || this.disposed) return;
     try {
+      const saved = (await this.accounts.store.read()).schedules.jobs[job.id];
+      if (!saved || saved.revision !== job.revision || saved.updatedAt !== job.updatedAt) return;
       await this.paseo.agents.ref(job.agentId).timeline.append({ type: "plugin", id: job.id, kind: "scheduled-message", version: 1, data: scheduleCard(job) });
       await this.accounts.store.update(s => { const current = s.schedules.jobs[job.id]; if (current?.revision === job.revision && current.updatedAt === job.updatedAt) current.timelineDirty = false; });
     } catch { /* Retry the canonical card on the next daemon tick. The reservation is already durable. */ }
@@ -137,11 +151,12 @@ export class ScheduleManager {
     const current = await this.accounts.store.update(s => {
       const j = s.schedules.jobs[job.id];
       if (!j || j.revision !== job.revision || !activeSchedule(j) && j.status !== "attention") return null;
-      Object.assign(j, { status, reason, updatedAt: this.iso(), timelineDirty: true }, extra); return j;
+      const at = this.iso();
+      Object.assign(j, { status, reason, updatedAt: at, finishedAt: finishedSchedule({ status }) ? at : null, timelineDirty: true }, extra); return j;
     });
     if (current) await this.publish(current);
     if (current?.status === "sent" && current.retryAfterSend) {
-      await this.accounts.store.update(s => { s.schedules.jobs[current.id].retryAfterSend = false; });
+      await this.accounts.store.update(s => { const j = s.schedules.jobs[current.id]; if (j) j.retryAfterSend = false; });
       const c = await this.context(current.agentId).catch(() => null);
       if (c && c.state.schedules.automatic[current.agentId] && c.agent.lastUserMessageAt === current.retryUserMessageAt)
         await this.reserveAutomatic(current.agentId);
@@ -231,7 +246,7 @@ export class ScheduleManager {
     }
   }
   kick(): Promise<void> {
-    if (this.disposed || !this.supported || !this.paseo) return Promise.resolve();
+    if (this.disposed || !this.paseo) return Promise.resolve();
     if (this.timer) clearTimeout(this.timer);
     if (this.running) return this.running;
     const run = this.tick().catch(() => {}).finally(() => {
@@ -242,19 +257,44 @@ export class ScheduleManager {
   }
   private async arm() {
     if (this.disposed) return;
-    const jobs = Object.values((await this.accounts.store.read()).schedules.jobs).filter(activeSchedule);
+    const jobs = this.supported ? Object.values((await this.accounts.store.read()).schedules.jobs).filter(activeSchedule) : [];
     const delay = Math.min(30000, ...jobs.map(j => { const delta = Date.parse(j.nextAttemptAt ?? j.dueAt) - this.now(); return delta > 0 ? delta : 1000; }));
     if (!this.disposed) { this.timer = setTimeout(() => { void this.kick(); }, delay); this.timer.unref?.(); }
   }
   private async tick() {
+    await this.pruneHistory();
     const jobs = Object.values((await this.accounts.store.read()).schedules.jobs);
-    const agents = new Set(jobs.filter(activeSchedule).map(j => j.agentId));
+    const agents = new Set(this.supported ? jobs.filter(activeSchedule).map(j => j.agentId) : []);
     for (const [id, stop] of this.watches) if (!agents.has(id)) { stop(); this.watches.delete(id); }
     for (const id of agents) if (!this.watches.has(id)) this.watches.set(id, this.paseo!.agents.ref(id).subscribe(() => { void this.kick(); }));
     for (const job of jobs) {
       if (this.disposed) break;
       if (job.timelineDirty) await this.publish(job);
-      if (activeSchedule(job)) await this.accounts.exclusive(() => this.execute(job));
+      if (this.supported && activeSchedule(job)) await this.accounts.exclusive(() => this.execute(job));
+    }
+    await this.removeCards();
+  }
+  private async pruneHistory() {
+    const expired = (job: Schedule) => finishedSchedule(job) && Date.parse(job.finishedAt ?? job.updatedAt) + scheduleRetentionMs <= this.now();
+    if (!Object.values((await this.accounts.store.read()).schedules.jobs).some(expired)) return;
+    await this.accounts.store.update(s => {
+      for (const job of Object.values(s.schedules.jobs)) if (expired(job)) {
+        s.schedules.removed[job.id] = job.agentId;
+        delete s.schedules.jobs[job.id];
+      }
+    });
+  }
+  private async removeCards() {
+    if (!this.paseo || this.disposed) return;
+    for (const [id, agentId] of Object.entries((await this.accounts.store.read()).schedules.removed)) {
+      if (this.disposed) break;
+      try {
+        // Replace only the plugin card with a content-free row; never alter conversation messages.
+        await this.paseo.agents.ref(agentId).timeline.append({ type: "plugin", id, kind: "scheduled-message", version: 1, data: { id, deleted: true } });
+      } catch (error) {
+        if (!(error instanceof Error) || !/^(?:Agent not found:|Unknown agent )/.test(error.message)) continue;
+      }
+      await this.accounts.store.update(s => { if (s.schedules.removed[id] === agentId) delete s.schedules.removed[id]; });
     }
   }
   private async execute(job: Schedule) {

@@ -1,13 +1,13 @@
 import type { PluginClientContext, PluginButtonRegistration } from "@getpaseo/plugin/client";
 import { AccountsSurface, AgentAccountsPanel } from "./client/accounts.js";
 import { scheduleUI } from "./client/schedules.js";
-import { ScheduleCardSchema } from "./shared/schedules.js";
+import { ScheduleTimelineSchema } from "./shared/schedules.js";
 
 export default function contribute(client: PluginClientContext) {
   const schedules = scheduleUI(client);
   client.addSurface("scheduled-messages", schedules.Surface);
   client.addSidebarItem({ id: "scheduled-messages", title: "예약 메시지", icon: "CalendarClock", surface: "scheduled-messages" });
-  client.addTimelineRenderer({ kind: "scheduled-message", version: 1, schema: ScheduleCardSchema, Component: schedules.Timeline });
+  client.addTimelineRenderer({ kind: "scheduled-message", version: 1, schema: ScheduleTimelineSchema, Component: schedules.Timeline });
   const pills = new Map<string, { workspaceId: string; registration: PluginButtonRegistration }>();
   let disposed = false;
   let release: (() => Promise<void>) | undefined;

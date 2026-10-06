@@ -5,7 +5,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useState, useSyncExternalStore } from "react";
 import type { input } from "zod";
 import { ActivityIndicator, Pressable, Text, View } from "react-native";
-import { changeSchedule, listSchedules, localDateTime, parseLocalDateTime, scheduleLabels, type ScheduleCard } from "../shared/schedules.js";
+import { changeSchedule, finishedSchedule, listSchedules, localDateTime, parseLocalDateTime, scheduleLabels, scheduleRetentionMs, type ScheduleCard, type ScheduleTimeline } from "../shared/schedules.js";
 import { formatResetCountdown, harnessLabels } from "../shared/accounts.js";
 import { Button, type Colors } from "./ui.js";
 
@@ -22,6 +22,23 @@ function useScheduleChange() {
   const rpc = useRpc(changeSchedule), cache = useQueryClient();
   return useMutation({ mutationFn: (input: input<typeof changeSchedule.input>) => rpc(input),
     onSuccess: () => { void cache.invalidateQueries({ queryKey: ["scheduled-messages"] }); } });
+}
+function DeleteScheduleModal({ job, colors, close }: { job: ScheduleCard; colors: Colors; close: () => void }) {
+  const change = useScheduleChange();
+  return <Modal title="예약 기록 삭제" open onOpenChange={open => { if (!open && !change.isPending) close(); }}>
+    <Modal.Content>
+      <View style={{ gap: 16 }}>
+        <Text style={{ color: colors.foreground, fontSize: 16, fontWeight: "600", lineHeight: 24 }}>{job.title}의 예약 기록을 삭제할까요?</Text>
+        <Text style={{ color: colors.foregroundMuted, fontSize: 14, lineHeight: 22 }}>예약 목록과 채팅의 예약 카드에서 삭제됩니다. 이미 전송된 메시지와 대화는 유지됩니다.</Text>
+        {change.error && <Text accessibilityRole="alert" style={{ color: colors.statusDanger, lineHeight: 21 }}>{publicError(change.error)}</Text>}
+        <View style={{ flexDirection: "row", flexWrap: "wrap", justifyContent: "flex-end", gap: 8 }}>
+          <Button colors={colors} disabled={change.isPending} onPress={close}>돌아가기</Button>
+          <Button colors={colors} danger icon="Trash2" disabled={change.isPending}
+            onPress={() => change.mutate({ action: "delete", id: job.id }, { onSuccess: close })}>{change.isPending ? "삭제 중…" : "삭제"}</Button>
+        </View>
+      </View>
+    </Modal.Content>
+  </Modal>;
 }
 function ScheduleForm({ agentId, colors, close, onOverview }: { agentId: string; colors: Colors; close: () => void; onOverview: () => void }) {
   const query = useSchedules(agentId), change = useScheduleChange();
@@ -115,8 +132,10 @@ export function scheduleUI(client: PluginClientContext) {
       <ScheduleForm key={props.agentId} agentId={props.agentId} colors={props.theme.colors} close={props.close} onOverview={() => { props.close(); open(); }} />
     </ScrollView>;
   }
-  function Timeline(props: PluginTimelineItemProps<ScheduleCard>) {
+  function Timeline(props: PluginTimelineItemProps<ScheduleTimeline>) {
     const job = props.item.data, colors = props.theme.colors, change = useScheduleChange();
+    const [deleting, setDeleting] = useState(false);
+    if ("deleted" in job) return null;
     return <View style={{ gap: 12, padding: 16, borderWidth: 1, borderColor: colors.border, backgroundColor: colors.surface1, borderRadius: 12 }}>
       <Pressable accessibilityRole="button" accessibilityLabel="예약 메시지 목록에서 보기" onPress={() => open(job.id)} style={{ flexDirection: "row", gap: 10, alignItems: "center", minHeight: 44 }}>
         <Icon name="CalendarClock" size={20} color={colors.accent} />
@@ -130,26 +149,45 @@ export function scheduleUI(client: PluginClientContext) {
         <Button colors={colors} onPress={() => open(job.id, true)}>수정</Button>
         <Button colors={colors} disabled={change.isPending} onPress={() => change.mutate({ action: "cancel", id: job.id })}>취소</Button>
       </View>}
+      {finishedSchedule(job) && <View style={{ alignItems: "flex-start" }}><Button colors={colors} danger icon="Trash2" onPress={() => setDeleting(true)}>삭제</Button></View>}
       {change.error && <Text accessibilityRole="alert" style={{ color: colors.statusDanger }}>{publicError(change.error)}</Text>}
+      {deleting && <DeleteScheduleModal job={job} colors={colors} close={() => setDeleting(false)} />}
     </View>;
   }
   function Surface(props: PluginSurfaceProps) {
     const colors = props.theme.colors, query = useSchedules(), change = useScheduleChange();
     const selected = useSyncExternalStore(subscribe, () => focus), [editAgent, setEditAgent] = useState<string | null>(null);
-    useEffect(() => { if (selected.edit) { const job = query.data?.jobs.find(j => j.id === selected.id); if (job) setEditAgent(job.agentId); } }, [selected, query.data]);
+    const [tab, setTab] = useState<"active" | "history">("active"), [deleting, setDeleting] = useState<ScheduleCard | null>(null);
+    const focusedJob = query.data?.jobs.find(j => j.id === selected.id);
+    useEffect(() => {
+      if (!focusedJob) return;
+      setTab(finishedSchedule(focusedJob) ? "history" : "active");
+      if (selected.edit && (focusedJob.status === "waiting" || focusedJob.status === "attention")) setEditAgent(focusedJob.agentId);
+    }, [selected, focusedJob?.id, focusedJob?.status, focusedJob?.agentId]);
+    const jobs = query.data?.jobs ?? [], activeCount = jobs.filter(job => !finishedSchedule(job)).length;
+    const visibleJobs = jobs.filter(job => finishedSchedule(job) === (tab === "history"));
     return <View style={{ flex: 1, backgroundColor: colors.surface0 }}>
       <ScrollView contentContainerStyle={{ padding: props.layout.compact ? 18 : 28, gap: 20, width: "100%", maxWidth: 1040, alignSelf: "center" }}>
         <View style={{ gap: 6 }}>
           <Text accessibilityRole="header" style={{ color: colors.foreground, fontSize: 26, fontWeight: "700" }}>예약 메시지</Text>
           <Text style={{ color: colors.foregroundMuted, fontSize: 14, lineHeight: 22 }}>Paseo 호스트가 실행 중이면 앱을 닫아도 동작합니다. 작업 중에는 종료를 기다립니다.</Text>
         </View>
+        <View accessibilityRole="tablist" style={{ flexDirection: "row", gap: 4, padding: 4, borderRadius: 10, backgroundColor: colors.surface1, borderWidth: 1, borderColor: colors.border }}>
+          {(["active", "history"] as const).map(value => <Pressable key={value} accessibilityRole="tab" accessibilityState={{ selected: tab === value }} aria-selected={tab === value}
+            onPress={() => setTab(value)} style={({ pressed }) => ({ flex: 1, minHeight: 44, paddingHorizontal: 12, paddingVertical: 10, flexDirection: "row", justifyContent: "center", alignItems: "center", gap: 8,
+              borderRadius: 7, backgroundColor: tab === value ? colors.surface2 : colors.surface1, opacity: pressed ? 0.8 : 1 })}>
+            <Text style={{ color: tab === value ? colors.foreground : colors.foregroundMuted, fontSize: 14, fontWeight: tab === value ? "600" : "400" }}>{value === "active" ? "활성 예약" : "완료·취소"}</Text>
+            {query.data && <Text style={{ color: colors.foregroundMuted, fontSize: 13 }}>{value === "active" ? activeCount : jobs.length - activeCount}</Text>}
+          </Pressable>)}
+        </View>
+        {tab === "history" && <Text style={{ color: colors.foregroundMuted, fontSize: 13, lineHeight: 20 }}>완료·취소 후 30일이 지나면 자동으로 삭제됩니다. 이미 전송된 메시지와 대화는 유지됩니다.</Text>}
         {query.isPending && <ActivityIndicator color={colors.accent} accessibilityLabel="예약 목록 불러오는 중" />}
         {query.isError && <Text accessibilityRole="alert" style={{ color: colors.statusDanger }}>{publicError(query.error)}</Text>}
-        {query.data?.jobs.length === 0 && <View style={{ paddingVertical: 40, gap: 8 }}>
-          <Text style={{ color: colors.foreground, fontSize: 18, fontWeight: "600" }}>예약된 메시지가 없습니다</Text>
-          <Text style={{ color: colors.foregroundMuted, fontSize: 14 }}>채팅 입력창의 예약 버튼에서 메시지와 시간을 지정하세요.</Text>
+        {query.data && visibleJobs.length === 0 && <View style={{ paddingVertical: 40, gap: 8 }}>
+          <Text style={{ color: colors.foreground, fontSize: 18, fontWeight: "600" }}>{tab === "active" ? "활성 예약이 없습니다" : "완료·취소된 예약이 없습니다"}</Text>
+          <Text style={{ color: colors.foregroundMuted, fontSize: 14, lineHeight: 22 }}>{tab === "active" ? "채팅 입력창의 예약 버튼에서 메시지와 시간을 지정하세요." : "종료된 예약 기록은 이곳에서 확인하고 삭제할 수 있습니다."}</Text>
         </View>}
-        {query.data?.jobs.map(job => <View key={job.id} style={{ gap: 14, padding: 18, borderRadius: 12, borderWidth: 1,
+        {visibleJobs.map(job => <View key={job.id} style={{ gap: 14, padding: 18, borderRadius: 12, borderWidth: 1,
           borderColor: selected.id === job.id ? colors.accent : colors.border, backgroundColor: colors.surface1 }}>
           <Pressable accessibilityRole="button" accessibilityLabel={`${job.title} 채팅 열기`} disabled={!props.navigation}
             onPress={() => props.navigation?.openAgent({ agentId: job.agentId })} style={{ flexDirection: "row", alignItems: "center", gap: 12, minHeight: 44 }}>
@@ -166,6 +204,10 @@ export function scheduleUI(client: PluginClientContext) {
             <Button colors={colors} onPress={() => setEditAgent(job.agentId)}>수정</Button>
             <Button colors={colors} disabled={change.isPending} onPress={() => change.mutate({ action: "cancel", id: job.id })}>취소</Button>
           </View>}
+          {finishedSchedule(job) && <View style={{ flexDirection: "row", flexWrap: "wrap", alignItems: "center", justifyContent: "space-between", gap: 10 }}>
+            <Text style={{ color: colors.foregroundMuted, fontSize: 13, lineHeight: 20 }}>자동 삭제 · {dateLabel(new Date(Date.parse(job.finishedAt ?? job.updatedAt) + scheduleRetentionMs).toISOString())}</Text>
+            <Button colors={colors} danger icon="Trash2" onPress={() => setDeleting(job)}>삭제</Button>
+          </View>}
         </View>)}
         {change.error && <Text accessibilityRole="alert" style={{ color: colors.statusDanger }}>{publicError(change.error)}</Text>}
         {!props.navigation && <Text style={{ color: colors.foregroundMuted }}>채팅으로 바로 이동하려면 Paseo 앱을 업데이트하세요.</Text>}
@@ -174,6 +216,7 @@ export function scheduleUI(client: PluginClientContext) {
       <Modal title="예약 수정" open={editAgent !== null} onOpenChange={value => { if (!value) { setEditAgent(null); focus = { ...focus, edit: false }; } }}>
         <Modal.Content>{editAgent && <ScheduleForm key={editAgent} agentId={editAgent} colors={colors} close={() => { setEditAgent(null); focus = { ...focus, edit: false }; }} onOverview={() => setEditAgent(null)} />}</Modal.Content>
       </Modal>
+      {deleting && <DeleteScheduleModal job={deleting} colors={colors} close={() => setDeleting(null)} />}
     </View>;
   }
   return { Composer, Timeline, Surface };
