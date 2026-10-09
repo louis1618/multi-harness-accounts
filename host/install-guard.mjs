@@ -1,4 +1,4 @@
-// Applies the reviewed 0.10.3 host extension to a STAGING runtime, preserving other patches.
+// Applies the reviewed host extension to a STAGING runtime, preserving other patches.
 // Never restarts a daemon or writes to a mounted/running AppImage.
 import { readFile, writeFile, copyFile } from 'node:fs/promises';
 import { resolve, join } from 'node:path';
@@ -8,7 +8,7 @@ import { installRewind } from './install-rewind.mjs';
 export async function installGuard(runtime) {
   const modules = join(resolve(runtime), 'node_modules', '@getpaseo');
   const version = JSON.parse(await readFile(join(modules, 'server', 'package.json'), 'utf8')).version;
-  if (version !== '0.10.3') throw Error('This host extension targets Paseo 0.10.3 only.');
+  if (!['0.10.3', '0.11.1'].includes(version)) throw Error('This host extension targets Paseo 0.10.3 or 0.11.1 only.');
   const changes = new Map();
   const replace = async (relative, before, after) => {
     const file = join(modules, relative), source = changes.get(file) ?? await readFile(file, 'utf8');
@@ -25,7 +25,8 @@ export async function installGuard(runtime) {
   }
   await replace('protocol/dist/messages.js', 'export const SendAgentMessageRequestSchema = z.object({\n', 'export const SendAgentMessageRequestSchema = z.object({\n    sendGuard: z.object({ lastUserMessageAt: z.string().nullable(), provider: z.string().optional(), sessionId: z.string().optional() }).optional(),\n');
   await replace('client/dist/daemon-client.js', '...(options?.activeTurnBehavior ? { activeTurnBehavior: options.activeTurnBehavior } : {}),', '...(options?.activeTurnBehavior ? { activeTurnBehavior: options.activeTurnBehavior } : {}),\n            ...(options?.sendGuard ? { sendGuard: options.sendGuard } : {}),');
-  await replace('server/dist/server/server/plugins/plugin-process.js', 'const contributedCleanup = setup({', 'const contributedCleanup = setup({\n        paseo,\n        capabilities: { guardedAgentMessages: 1 },');
+  const entry = version === '0.11.1' ? 'contribute' : 'setup';
+  await replace('server/dist/server/server/plugins/plugin-process.js', `const contributedCleanup = ${entry}({`, `const contributedCleanup = ${entry}({\n        paseo,\n        capabilities: { guardedAgentMessages: 1 },`);
   const guard = `if (options?.sendGuard) {
         const agent = agentManager.getAgent(agentId);
         if (!agent || agent.lifecycle === "closed") throw new Error("SCHEDULE_GUARD_ARCHIVED");

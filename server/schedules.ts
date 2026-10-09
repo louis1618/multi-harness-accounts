@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import type { RpcInput } from "@getpaseo/plugin";
 import type { PluginHandlerContext } from "@getpaseo/plugin/server";
 import { HarnessSchema, type Quota } from "../shared/accounts.js";
-import { activeSchedule, changeSchedule, finishedSchedule, scheduleCard, scheduleRetentionMs, type Schedule } from "../shared/schedules.js";
+import { activeSchedule, changeSchedule, finishedSchedule, scheduleCard, scheduleRetentionMs, scheduleSupportMessage, type Schedule } from "../shared/schedules.js";
 import { AccountManager, selectedAccount, isUsageLimitFailure } from "./manager.js";
 import { AccountError } from "./store.js";
 import { QuotaError, applicableQuotaWindows, hasRemainingQuota } from "./usage.js";
@@ -95,7 +95,7 @@ export class ScheduleManager {
       if (job.status === "sending") throw new AccountError("전송 결과를 확인 중입니다. 확인 후 변경하세요.");
       if (activeSchedule(job) || job.status === "attention") await this.mark(job, "canceled", "사용자가 예약을 취소했습니다.");
     } else {
-      if (!this.supported) throw new AccountError("안전한 예약 전송을 위해 Paseo 호스트 업데이트가 필요합니다.");
+      if (!this.supported) throw new AccountError(scheduleSupportMessage);
       if (input.action === "automatic") {
         await this.context(input.agentId);
         await this.accounts.store.update(s => {

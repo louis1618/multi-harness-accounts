@@ -5,7 +5,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useState, useSyncExternalStore } from "react";
 import type { input } from "zod";
 import { ActivityIndicator, Pressable, Text, View } from "react-native";
-import { changeSchedule, finishedSchedule, listSchedules, localDateTime, parseLocalDateTime, scheduleLabels, scheduleRetentionMs, type ScheduleCard, type ScheduleTimeline } from "../shared/schedules.js";
+import { changeSchedule, finishedSchedule, listSchedules, localDateTime, parseLocalDateTime, scheduleLabels, scheduleRetentionMs, scheduleSupportMessage, type ScheduleCard, type ScheduleTimeline } from "../shared/schedules.js";
 import { formatResetCountdown, harnessLabels } from "../shared/accounts.js";
 import { Button, type Colors } from "./ui.js";
 
@@ -68,7 +68,7 @@ function ScheduleForm({ agentId, colors, close, onOverview }: { agentId: string;
     </View>
     {query.isPending && <ActivityIndicator color={colors.accent} accessibilityLabel="예약 정보 조회 중" />}
     {query.isError && <Text accessibilityRole="alert" style={{ color: colors.statusDanger }}>{publicError(query.error)}</Text>}
-    {query.data && !supported && <Text accessibilityRole="alert" style={{ color: colors.statusWarning, lineHeight: 22 }}>안전한 예약 전송을 위해 Paseo 호스트 업데이트가 필요합니다.</Text>}
+    {query.data && !supported && <Text accessibilityRole="alert" style={{ color: colors.statusWarning, lineHeight: 22 }}>{scheduleSupportMessage}</Text>}
     <View style={{ gap: 8 }}>
       <Text style={{ color: colors.foreground, fontSize: 14, fontWeight: "500" }}>예약 메시지</Text>
       <TextInput accessibilityLabel="예약 메시지" value={message} onChangeText={setMessage} multiline maxLength={16000}

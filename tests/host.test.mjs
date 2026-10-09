@@ -44,8 +44,8 @@ async function fixture(t, version = '0.10.3', source = original) {
   await writeFile(file, source);
   return { root, file };
 }
-test('host preparation applies Claude identity fix, preserves prior changes and is idempotent', async t => {
-  const { root, file } = await fixture(t);
+for (const version of ['0.10.3', '0.11.1']) test(`host ${version} preparation preserves Claude identity and is idempotent`, async t => {
+  const { root, file } = await fixture(t, version);
   assert.deepEqual(await installRewind(root), [file]);
   const patched = await readFile(file, 'utf8');
   assert.match(patched, /this\.input\.push\(sdkMessage\);\s*\/\/[^\n]+\s*this\.emitSubmittedUserMessage\(sdkMessage, turnId, options\?\.clientMessageId\);\s*this\.startQueryPump\(\);/);
@@ -59,7 +59,7 @@ test('host preparation applies Claude identity fix, preserves prior changes and 
 });
 test('unexpected version, partial fix and changed runtime fail before writing', async t => {
   const version = await fixture(t, '0.11.0');
-  await assert.rejects(installRewind(version.root), /0.10.3 only/);
+  await assert.rejects(installRewind(version.root), /0.10.3 or 0.11.1 only/);
   assert.equal(await readFile(version.file, 'utf8'), original);
   for (const source of [original.replace('this.startQueryPump();', 'changed();'), original + '// Paseo rewind identity: publish before the query can finish.']) {
     const { root, file } = await fixture(t, '0.10.3', source);

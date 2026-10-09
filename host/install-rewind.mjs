@@ -5,8 +5,8 @@ import { pathToFileURL } from 'node:url';
 
 export async function installRewind(runtime) {
   const modules = join(resolve(runtime), 'node_modules', '@getpaseo');
-  if (JSON.parse(await readFile(join(modules, 'server/package.json'), 'utf8')).version !== '0.10.3')
-    throw Error('This rewind fix targets Paseo 0.10.3 only.');
+  if (!['0.10.3', '0.11.1'].includes(JSON.parse(await readFile(join(modules, 'server/package.json'), 'utf8')).version))
+    throw Error('This rewind fix targets Paseo 0.10.3 or 0.11.1 only.');
   const file = join(modules, 'server/dist/server/server/agent/providers/claude/agent.js');
   const original = await readFile(file, 'utf8');
   const marker = '// Paseo rewind identity: publish before the query can finish.';
