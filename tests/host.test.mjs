@@ -44,7 +44,7 @@ async function fixture(t, version = '0.10.3', source = original) {
   await writeFile(file, source);
   return { root, file };
 }
-test('host preparation preserves Claude identity and is idempotent regardless of version', async t => {
+test('Claude identity repair has no version allowlist and is idempotent for compatible host shape', async t => {
   const version = '99.0.0';
   const { root, file } = await fixture(t, version);
   assert.deepEqual(await installRewind(root), [file]);
