@@ -1,0 +1,11 @@
+import vm from 'node:vm';import assert from 'node:assert/strict';import {readFile} from 'node:fs/promises';import {createRequire} from 'node:module';
+const requireDev=createRequire(new URL('../package.json',import.meta.url));
+const compiled=await readFile(process.argv[2],'utf8');assert.ok(!/expo-file-system|expo-sharing|availableDiskSpace|downloadSink|files\.download/.test(compiled),'App-local download code returned');
+const source=compiled.replace('return module.exports;\n})','module.exports.mediaHtml=mediaHtml;module.exports.browserMedia=browserMedia;module.exports.keyboard=keyboard;\nreturn module.exports;\n})');
+const listeners=new Map(),platform={OS:'ios',select:o=>o.ios??o.native??o.default};
+const context=vm.createContext({console,URL,TextEncoder,TextDecoder,setTimeout,clearTimeout,setInterval,clearInterval});context.window=context;context.addEventListener=(name,fn)=>listeners.set(name,fn);context.removeEventListener=name=>listeners.delete(name);
+const result=vm.runInContext(source,context)(name=>name==='react-native'?{Platform:platform}:name==='@getpaseo/plugin'?{defineRpc:value=>value}:name.startsWith('@getpaseo/plugin/client')?{}:requireDev(name));
+const html=result.mediaHtml('video','https://example.com/movie.mp4?name="<script>','#fff','#000');assert.ok(!html.includes('name="<script>'));assert.match(html,/&quot;&lt;script&gt;/);assert.match(html,/playsinline/);assert.throws(()=>result.mediaHtml('image','file:///private','#fff','#000'));
+const element=result.browserMedia('video','https://example.com/movie.mp4',300,()=>{});assert.equal(element.type,'video');assert.equal(element.props.controls,true);
+platform.OS='web';let shortcuts=0;const stop=result.keyboard(()=>{shortcuts++;return true;});listeners.get('keydown')({key:' ',target:{tagName:'VIDEO'},preventDefault(){throw Error('Media keyboard captured');}});assert.equal(shortcuts,0);stop();
+console.log('Production bundle passed: URL-only downloads, no native storage/Metro globals, safe media HTML and keyboard controls.');

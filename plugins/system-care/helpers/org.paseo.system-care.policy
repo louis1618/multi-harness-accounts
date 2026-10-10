@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN" "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+<policyconfig>
+ <vendor>Paseo System Care</vendor>
+ <action id="org.paseo.system-care.maintenance">
+  <description>Approved system cache maintenance</description>
+  <message>APT 다운로드 캐시 또는 30일 이상 지난 보관 로그 정리를 승인하세요.</message>
+  <defaults><allow_any>auth_admin</allow_any><allow_inactive>auth_admin</allow_inactive><allow_active>auth_admin</allow_active></defaults>
+  <annotate key="org.freedesktop.policykit.exec.path">/usr/local/libexec/paseo-system-care-helper</annotate>
+ </action>
+</policyconfig>

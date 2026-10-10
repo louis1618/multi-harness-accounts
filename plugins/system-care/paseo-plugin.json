@@ -1,0 +1,7 @@
+{
+  "id": "system-care",
+  "description": "Ubuntu 용량·리소스 진단, 승인 후 정리와 Docker 관리.",
+  "requirements": {
+    "paseo": ">=0.10.0 <0.12.0"
+  }
+}

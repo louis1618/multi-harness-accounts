@@ -1,0 +1,7 @@
+{
+  "id": "home-finder",
+  "requirements": {
+    "paseo": ">=0.10.0 <0.12.0"
+  },
+  "description": "Finder 스타일 홈 폴더 탐색기: 보기 전환, 즐겨찾기, 이름 변경, 영상·문서 미리보기, URL 다운로드와 휴지통 복원."
+}

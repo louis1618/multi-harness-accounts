@@ -1,0 +1,6 @@
+node_modules/
+.test-build/
+*.log
+*.tgz
+.env*
+__pycache__/
