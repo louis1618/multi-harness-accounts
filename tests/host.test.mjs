@@ -44,7 +44,8 @@ async function fixture(t, version = '0.10.3', source = original) {
   await writeFile(file, source);
   return { root, file };
 }
-for (const version of ['0.10.3', '0.11.1']) test(`host ${version} preparation preserves Claude identity and is idempotent`, async t => {
+test('host preparation preserves Claude identity and is idempotent regardless of version', async t => {
+  const version = '99.0.0';
   const { root, file } = await fixture(t, version);
   assert.deepEqual(await installRewind(root), [file]);
   const patched = await readFile(file, 'utf8');
@@ -57,10 +58,8 @@ for (const version of ['0.10.3', '0.11.1']) test(`host ${version} preparation pr
   assert.deepEqual(await installRewind(root), []);
   assert.equal(await readFile(file, 'utf8'), patched);
 });
-test('unexpected version, partial fix and changed runtime fail before writing', async t => {
-  const version = await fixture(t, '0.11.0');
-  await assert.rejects(installRewind(version.root), /0.10.3 or 0.11.1 only/);
-  assert.equal(await readFile(version.file, 'utf8'), original);
+test('changed runtime and partial fix fail before writing', async t => {
+  const version = await fixture(t, '99.0.0');
   for (const source of [original.replace('this.startQueryPump();', 'changed();'), original + '// Paseo rewind identity: publish before the query can finish.']) {
     const { root, file } = await fixture(t, '0.10.3', source);
     await assert.rejects(installRewind(root), /Unexpected|Partial/);

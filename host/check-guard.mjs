@@ -1,7 +1,8 @@
 // Exercises a prepared runtime with local state only; never connects to a daemon or model.
 import assert from 'node:assert/strict';
-import { readFile, mkdtemp, readdir, rm } from 'node:fs/promises';
-import { resolve, join } from 'node:path';
+import { randomUUID } from 'node:crypto';
+import { readFile, writeFile, copyFile, mkdtemp, mkdir, readdir, rm } from 'node:fs/promises';
+import { resolve, join, dirname } from 'node:path';
 import { tmpdir } from 'node:os';
 import { pathToFileURL } from 'node:url';
 import { installGuard } from './install-guard.mjs';
@@ -32,11 +33,22 @@ for (const changed of [{ ...guard, lastUserMessageAt: null }, { ...guard, provid
   await assert.rejects(run(changed), /SCHEDULE_GUARD_CHANGED/);
 assert.equal(sends, 0);
 await run(guard); await assert.rejects(run(guard), /SCHEDULE_GUARD_BUSY/); assert.equal(sends, 1);
-const { SendAgentMessageRequestSchema } = await import(pathToFileURL(join(modules, 'protocol/dist/messages.js')).href);
-assert.deepEqual(SendAgentMessageRequestSchema.parse({ type: 'send_agent_message_request', requestId: 'fixture', agentId: 'fixture', text: 'Continue', sendGuard: guard }).sendGuard, guard);
-const { MessageReceipts } = await import(pathToFileURL(join(modules, 'server/dist/server/server/message-receipts/index.js')).href);
-const directory = await mkdtemp(join(tmpdir(), 'paseo-guard-check-'));
+const stagedProtocol = await readFile(join(modules, 'protocol/dist/messages.js'), 'utf8');
+const protocolFixture = join(dirname(import.meta.dirname), 'node_modules/@getpaseo/protocol/dist', `messages.${randomUUID()}.mjs`);
+await writeFile(protocolFixture, stagedProtocol);
 try {
+  const { SendAgentMessageRequestSchema } = await import(pathToFileURL(protocolFixture).href);
+  assert.deepEqual(SendAgentMessageRequestSchema.parse({ type: 'send_agent_message_request', requestId: 'fixture', agentId: 'fixture', text: 'Continue', sendGuard: guard }).sendGuard, guard);
+} finally { await rm(protocolFixture, { force: true }); }
+const directory = await mkdtemp(join(tmpdir(), 'paseo-guard-check-'));
+const receiptRuntime = await mkdtemp(join(dirname(import.meta.dirname), 'node_modules/.paseo-guard-check-'));
+try {
+  const receiptsPath = join(receiptRuntime, '@getpaseo/server/dist/server/server/message-receipts/index.js');
+  const atomicPath = join(receiptRuntime, '@getpaseo/server/dist/server/server/atomic-file.js');
+  await Promise.all([receiptsPath, atomicPath].map(path => mkdir(dirname(path), { recursive: true })));
+  await Promise.all([copyFile(join(modules, 'server/dist/server/server/message-receipts/index.js'), receiptsPath),
+    copyFile(join(modules, 'server/dist/server/server/atomic-file.js'), atomicPath)]);
+  const { MessageReceipts } = await import(pathToFileURL(receiptsPath).href);
   const receipts = new MessageReceipts(directory);
   const input = { agentId: 'fixture', messageId: 'fixture', request: { prompt: 'Continue', sendGuard: guard } };
   for (const code of ['BUSY', 'CHANGED', 'ARCHIVED']) {
@@ -50,6 +62,6 @@ try {
   const uncertain = { ...input, messageId: 'uncertain', send: async () => { throw Error('disconnected'); } };
   await assert.rejects(receipts.send(uncertain), /disconnected/);
   await assert.rejects(receipts.send(uncertain), /agent_request_outcome_unknown/);
-} finally { await rm(directory, { recursive: true, force: true }); }
+} finally { await Promise.all([rm(directory, { recursive: true, force: true }), rm(receiptRuntime, { recursive: true, force: true })]); }
 assert.deepEqual(await installGuard(root), []);
 console.log(JSON.stringify({ guardedMessages: true, approvalsPreserved: true, receiptDedupe: true, protocolPreservesGuard: true, installerIdempotent: true, productionPrompts: 0 }));

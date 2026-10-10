@@ -7,16 +7,17 @@ import { installRewind } from './install-rewind.mjs';
 
 export async function installGuard(runtime) {
   const modules = join(resolve(runtime), 'node_modules', '@getpaseo');
-  const version = JSON.parse(await readFile(join(modules, 'server', 'package.json'), 'utf8')).version;
-  if (!['0.10.3', '0.11.1'].includes(version)) throw Error('This host extension targets Paseo 0.10.3 or 0.11.1 only.');
+  const pluginFile = join(modules, 'server/dist/server/server/plugins/plugin-process.js');
+  const pluginSource = await readFile(pluginFile, 'utf8');
+  const entries = [...pluginSource.matchAll(/const contributedCleanup = (setup|contribute)\(\{/g)];
+  if (entries.length !== 1) throw Error('Unexpected plugin lifecycle shape; no files changed.');
   const changes = new Map();
   const replace = async (relative, before, after) => {
     const file = join(modules, relative), source = changes.get(file) ?? await readFile(file, 'utf8');
     if (!source.includes(before) || source.indexOf(before) !== source.lastIndexOf(before)) throw Error(`Unexpected runtime shape: ${relative}`);
     changes.set(file, source.replace(before, after));
   };
-  const pluginFile = join(modules, 'server/dist/server/server/plugins/plugin-process.js');
-  if ((await readFile(pluginFile, 'utf8')).includes('guardedAgentMessages: 1')) {
+  if (pluginSource.includes('guardedAgentMessages: 1')) {
     for (const [file, token] of [['protocol/dist/messages.js','sendGuard: z.object'], ['client/dist/daemon-client.js','options?.sendGuard'],
       ['server/dist/server/server/agent/agent-prompt.js','SCHEDULE_GUARD_CHANGED'], ['server/dist/server/server/session.js','sendGuard: msg.sendGuard'],
       ['server/dist/server/server/message-receipts/index.js','SCHEDULE_GUARD_(BUSY|CHANGED|ARCHIVED)']])
@@ -25,7 +26,7 @@ export async function installGuard(runtime) {
   }
   await replace('protocol/dist/messages.js', 'export const SendAgentMessageRequestSchema = z.object({\n', 'export const SendAgentMessageRequestSchema = z.object({\n    sendGuard: z.object({ lastUserMessageAt: z.string().nullable(), provider: z.string().optional(), sessionId: z.string().optional() }).optional(),\n');
   await replace('client/dist/daemon-client.js', '...(options?.activeTurnBehavior ? { activeTurnBehavior: options.activeTurnBehavior } : {}),', '...(options?.activeTurnBehavior ? { activeTurnBehavior: options.activeTurnBehavior } : {}),\n            ...(options?.sendGuard ? { sendGuard: options.sendGuard } : {}),');
-  const entry = version === '0.11.1' ? 'contribute' : 'setup';
+  const entry = entries[0][1];
   await replace('server/dist/server/server/plugins/plugin-process.js', `const contributedCleanup = ${entry}({`, `const contributedCleanup = ${entry}({\n        paseo,\n        capabilities: { guardedAgentMessages: 1 },`);
   const guard = `if (options?.sendGuard) {
         const agent = agentManager.getAgent(agentId);

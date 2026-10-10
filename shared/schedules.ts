@@ -3,7 +3,7 @@ import { z } from "zod";
 
 export const ScheduleStatus = z.enum(["waiting", "sending", "sent", "canceled", "attention"]);
 export const scheduleRetentionMs = 30 * 86400000;
-export const scheduleSupportMessage = "예약 전송용 안전 확장이 이 호스트에 적용되지 않았습니다. 확장 적용 후 호스트 재시작이 필요합니다.";
+export const scheduleSupportMessage = "이 Paseo 호스트에 예약 전송 안전 기능이 없습니다. 호스트 확장을 적용하고 앱을 재시작하세요.";
 export const scheduleLabels: Record<z.infer<typeof ScheduleStatus>, string> = {
   waiting: "예약 중", sending: "전송 확인 중", sent: "전송 완료", canceled: "취소됨", attention: "확인 필요",
 };

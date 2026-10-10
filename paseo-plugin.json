@@ -2,7 +2,7 @@
   "id": "multi-harness-accounts",
   "description": "Codex·Claude Code 계정, 사용량, 공통 플러그인·스킬·MCP 관리.",
   "requirements": {
-    "paseo": ">=0.10.0 <0.12.0"
+    "paseo": ">=0.10.0"
   },
   "build": [
     [
